@@ -1,6 +1,6 @@
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `presage/src/store.rs`."><title>store.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="presage" data-themes="" data-resource-suffix="" data-rustdoc-version="1.96.0 (ac68faa20 2026-05-25)" data-channel="1.96.0" data-search-js="search-b5634cc7.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">presage/</div>store.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Traits that are used by the manager for storing the data.
 <a href=#2 id=2 data-nosnippet>2</a>
-<a href=#3 id=3 data-nosnippet>3</a></span><span class="kw">use </span>std::{fmt, future::Future, ops::RangeBounds, time::SystemTime};
+<a href=#3 id=3 data-nosnippet>3</a></span><span class="kw">use </span>std::{fmt, future::Future, ops::RangeBounds};
 <a href=#4 id=4 data-nosnippet>4</a>
 <a href=#5 id=5 data-nosnippet>5</a><span class="kw">use </span>libsignal_service::{
 <a href=#6 id=6 data-nosnippet>6</a>    content::{ContentBody, Metadata},
@@ -529,7 +529,7 @@
 <a href=#529 id=529 data-nosnippet>529</a>                target_sent_timestamp: <span class="prelude-val">Some</span>(ts),
 <a href=#530 id=530 data-nosnippet>530</a>                ..
 <a href=#531 id=531 data-nosnippet>531</a>            }) =&gt; ts,
-<a href=#532 id=532 data-nosnippet>532</a>            <span class="kw">_ </span>=&gt; <span class="self">self</span>.metadata.timestamp,
+<a href=#532 id=532 data-nosnippet>532</a>            <span class="kw">_ </span>=&gt; <span class="self">self</span>.metadata.timestamp.timestamp_millis() <span class="kw">as </span>u64,
 <a href=#533 id=533 data-nosnippet>533</a>        }
 <a href=#534 id=534 data-nosnippet>534</a>    }
 <a href=#535 id=535 data-nosnippet>535</a>}
@@ -602,27 +602,26 @@
 <a href=#602 id=602 data-nosnippet>602</a>            destination: sender,
 <a href=#603 id=603 data-nosnippet>603</a>            sender_device: <span class="kw-2">*</span>DEFAULT_DEVICE_ID,
 <a href=#604 id=604 data-nosnippet>604</a>            server_guid: <span class="prelude-val">None</span>,
-<a href=#605 id=605 data-nosnippet>605</a>            timestamp: SystemTime::now()
-<a href=#606 id=606 data-nosnippet>606</a>                .duration_since(SystemTime::UNIX_EPOCH)
-<a href=#607 id=607 data-nosnippet>607</a>                .unwrap_or_default()
-<a href=#608 id=608 data-nosnippet>608</a>                .as_millis() <span class="kw">as </span>u64,
-<a href=#609 id=609 data-nosnippet>609</a>            needs_receipt: <span class="bool-val">false</span>,
-<a href=#610 id=610 data-nosnippet>610</a>            unidentified_sender: <span class="bool-val">false</span>,
-<a href=#611 id=611 data-nosnippet>611</a>            was_plaintext: <span class="bool-val">false</span>,
-<a href=#612 id=612 data-nosnippet>612</a>        },
-<a href=#613 id=613 data-nosnippet>613</a>        body: SyncMessage {
-<a href=#614 id=614 data-nosnippet>614</a>            verified: <span class="prelude-val">Some</span>(Verified {
-<a href=#615 id=615 data-nosnippet>615</a>                destination_aci: <span class="prelude-val">None</span>,
-<a href=#616 id=616 data-nosnippet>616</a>                destination_aci_binary: <span class="prelude-val">None</span>,
-<a href=#617 id=617 data-nosnippet>617</a>                identity_key: <span class="prelude-val">Some</span>(right_identity_key.public_key().serialize().to_vec()),
-<a href=#618 id=618 data-nosnippet>618</a>                state: <span class="prelude-val">Some</span>(verified_state.into()),
-<a href=#619 id=619 data-nosnippet>619</a>                null_message: <span class="prelude-val">None</span>,
-<a href=#620 id=620 data-nosnippet>620</a>            }),
-<a href=#621 id=621 data-nosnippet>621</a>            ..Default::default()
-<a href=#622 id=622 data-nosnippet>622</a>        }
-<a href=#623 id=623 data-nosnippet>623</a>        .into(),
-<a href=#624 id=624 data-nosnippet>624</a>    };
-<a href=#625 id=625 data-nosnippet>625</a>
-<a href=#626 id=626 data-nosnippet>626</a>    store.save_message(<span class="kw-2">&amp;</span>thread, verified_sync_message).<span class="kw">await
-<a href=#627 id=627 data-nosnippet>627</a></span>}
+<a href=#605 id=605 data-nosnippet>605</a>            timestamp: chrono::Utc::now(),
+<a href=#606 id=606 data-nosnippet>606</a>            <span class="comment">// No messages were sent, just use the current time as the server timestamp.
+<a href=#607 id=607 data-nosnippet>607</a>            </span>server_timestamp: chrono::Utc::now(),
+<a href=#608 id=608 data-nosnippet>608</a>            needs_receipt: <span class="bool-val">false</span>,
+<a href=#609 id=609 data-nosnippet>609</a>            unidentified_sender: <span class="bool-val">false</span>,
+<a href=#610 id=610 data-nosnippet>610</a>            was_plaintext: <span class="bool-val">false</span>,
+<a href=#611 id=611 data-nosnippet>611</a>        },
+<a href=#612 id=612 data-nosnippet>612</a>        body: SyncMessage {
+<a href=#613 id=613 data-nosnippet>613</a>            verified: <span class="prelude-val">Some</span>(Verified {
+<a href=#614 id=614 data-nosnippet>614</a>                destination_aci: <span class="prelude-val">None</span>,
+<a href=#615 id=615 data-nosnippet>615</a>                destination_aci_binary: <span class="prelude-val">None</span>,
+<a href=#616 id=616 data-nosnippet>616</a>                identity_key: <span class="prelude-val">Some</span>(right_identity_key.public_key().serialize().to_vec()),
+<a href=#617 id=617 data-nosnippet>617</a>                state: <span class="prelude-val">Some</span>(verified_state.into()),
+<a href=#618 id=618 data-nosnippet>618</a>                null_message: <span class="prelude-val">None</span>,
+<a href=#619 id=619 data-nosnippet>619</a>            }),
+<a href=#620 id=620 data-nosnippet>620</a>            ..Default::default()
+<a href=#621 id=621 data-nosnippet>621</a>        }
+<a href=#622 id=622 data-nosnippet>622</a>        .into(),
+<a href=#623 id=623 data-nosnippet>623</a>    };
+<a href=#624 id=624 data-nosnippet>624</a>
+<a href=#625 id=625 data-nosnippet>625</a>    store.save_message(<span class="kw-2">&amp;</span>thread, verified_sync_message).<span class="kw">await
+<a href=#626 id=626 data-nosnippet>626</a></span>}
 </code></pre></div></section></main></body></html>
