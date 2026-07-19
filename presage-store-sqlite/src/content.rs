@@ -13,13 +13,132 @@ use presage::{
     proto::{Verified, verified},
     store::{ContentsStore, StickerPack, Thread},
 };
-use sqlx::{query, query_as, query_scalar, types::Json};
+use sqlx::{Row, query, query_as, query_scalar, types::Json};
 
 use crate::{
     SqliteStore, SqliteStoreError,
     data::{SqlContact, SqlGroup, SqlMessage, SqlProfile, SqlStickerPack},
     error::SqlxErrorExt,
 };
+
+impl SqliteStore {
+    /// Prepare durable per-client message projection tracking.
+    ///
+    /// Messages which existed before a client first registers are treated as
+    /// already projected. Messages saved afterwards remain pending until the
+    /// client explicitly acknowledges them.
+    pub async fn initialize_message_projection(
+        &self,
+        client: &str,
+    ) -> Result<(), SqliteStoreError> {
+        let mut transaction = self.db.begin().await?;
+        query(
+            "CREATE TABLE IF NOT EXISTS client_message_projection_state (\
+             client TEXT PRIMARY KEY NOT NULL)",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        query(
+            "CREATE TABLE IF NOT EXISTS client_message_projection (\
+             client TEXT NOT NULL, sender_service_id TEXT NOT NULL, \
+             destination_service_id TEXT NOT NULL, ts INTEGER NOT NULL, \
+             PRIMARY KEY (client, sender_service_id, destination_service_id, ts))",
+        )
+        .execute(&mut *transaction)
+        .await?;
+
+        let registered =
+            query("INSERT OR IGNORE INTO client_message_projection_state(client) VALUES (?)")
+                .bind(client)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                != 0;
+        if registered {
+            query(
+                "INSERT OR IGNORE INTO client_message_projection(\
+                 client, sender_service_id, destination_service_id, ts) \
+                 SELECT ?, sender_service_id, destination_service_id, ts \
+                 FROM thread_messages",
+            )
+            .bind(client)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Return messages saved by Presage which this client has not acknowledged.
+    pub async fn unprojected_messages(
+        &self,
+        client: &str,
+    ) -> Result<Vec<Content>, SqliteStoreError> {
+        let rows = query(
+            r#"SELECT
+                m.ts,
+                m.server_ts,
+                m.sender_service_id,
+                m.sender_device_id,
+                m.destination_service_id,
+                m.needs_receipt,
+                m.unidentified_sender,
+                m.content_body,
+                m.was_plaintext
+            FROM thread_messages m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM client_message_projection p
+                WHERE p.client = ?
+                  AND p.sender_service_id = m.sender_service_id
+                  AND p.destination_service_id = m.destination_service_id
+                  AND p.ts = m.ts)
+            ORDER BY coalesce(m.server_ts, m.ts), m.ts"#,
+        )
+        .bind(client)
+        .fetch_all(&self.db)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                SqlMessage {
+                    ts: row.try_get("ts")?,
+                    server_ts: row.try_get("server_ts")?,
+                    sender_service_id: row.try_get("sender_service_id")?,
+                    sender_device_id: row.try_get("sender_device_id")?,
+                    destination_service_id: row.try_get("destination_service_id")?,
+                    needs_receipt: row.try_get("needs_receipt")?,
+                    unidentified_sender: row.try_get("unidentified_sender")?,
+                    content_body: row.try_get("content_body")?,
+                    was_plaintext: row.try_get("was_plaintext")?,
+                }
+                .try_into()
+            })
+            .collect()
+    }
+
+    /// Mark one stored message as accepted by a client projection.
+    pub async fn mark_message_projected(
+        &self,
+        client: &str,
+        content: &Content,
+    ) -> Result<(), SqliteStoreError> {
+        let sender = content.metadata.sender.service_id_string();
+        let destination = content.metadata.destination.service_id_string();
+        let timestamp = content.metadata.timestamp.timestamp_millis();
+        query(
+            "INSERT OR IGNORE INTO client_message_projection(\
+             client, sender_service_id, destination_service_id, ts) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(client)
+        .bind(sender)
+        .bind(destination)
+        .bind(timestamp)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+}
 
 impl ContentsStore for SqliteStore {
     type ContentsStoreError = SqliteStoreError;
@@ -742,5 +861,91 @@ impl BoundExt for Bound<&u64> {
             Bound::Included(x) => (None, Some(*x as i64)),
             Bound::Unbounded => (None, None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use presage::{
+        libsignal_service::{
+            content::{Content, ContentBody, DataMessage, Metadata},
+            protocol::{Aci, DeviceId, ServiceId},
+        },
+        store::{ContentsStore, Thread},
+    };
+    use uuid::Uuid;
+
+    use crate::{OnNewIdentity, SqliteStore};
+
+    fn message(sender: ServiceId, destination: ServiceId, timestamp: u64) -> Content {
+        let datetime = Utc.timestamp_millis_opt(timestamp as i64).unwrap();
+        Content {
+            metadata: Metadata {
+                sender,
+                destination,
+                sender_device: DeviceId::try_from(1u32).unwrap(),
+                server_guid: None,
+                timestamp: datetime,
+                server_timestamp: datetime,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+            },
+            body: ContentBody::DataMessage(DataMessage {
+                body: Some("hello".into()),
+                timestamp: Some(timestamp),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn tracks_only_messages_saved_after_projection_initialization() {
+        let path = std::env::temp_dir().join(format!(
+            "presage-message-projection-{}.sqlite",
+            rand::random::<u64>()
+        ));
+        let store = SqliteStore::open(path.to_str().unwrap(), OnNewIdentity::Reject)
+            .await
+            .unwrap();
+        let sender = ServiceId::Aci(Aci::from(Uuid::from_u128(1)));
+        let destination = ServiceId::Aci(Aci::from(Uuid::from_u128(2)));
+        let thread = Thread::Contact(sender);
+
+        let historical = message(sender, destination, 1_000);
+        store.save_message(&thread, historical).await.unwrap();
+        store
+            .initialize_message_projection("test-client")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unprojected_messages("test-client")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let pending = message(sender, destination, 2_000);
+        store.save_message(&thread, pending.clone()).await.unwrap();
+        let unprojected = store.unprojected_messages("test-client").await.unwrap();
+        assert_eq!(unprojected.len(), 1);
+        assert_eq!(unprojected[0].metadata.timestamp.timestamp_millis(), 2_000);
+
+        store
+            .mark_message_projected("test-client", &pending)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unprojected_messages("test-client")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        store.db.close().await;
+        let _ = std::fs::remove_file(path);
     }
 }
