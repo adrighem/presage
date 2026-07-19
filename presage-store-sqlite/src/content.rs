@@ -6,7 +6,7 @@ use presage::{
         Profile,
         content::Metadata,
         prelude::{Content, ProfileKey, Uuid},
-        protocol::ServiceId,
+        protocol::{Aci, ServiceId},
         zkgroup::GroupMasterKeyBytes,
     },
     model::{contacts::Contact, groups::Group},
@@ -440,6 +440,10 @@ impl ContentsStore for SqliteStore {
             state,
             ..
         } = &contact.verified;
+        let destination_aci = destination_aci
+            .as_deref()
+            .and_then(Aci::parse_from_service_id_string)
+            .map(Uuid::from);
         let is_verified = match verified::State::try_from(state.unwrap_or_default()) {
             Err(_) | Ok(verified::State::Default) => None,
             Ok(verified::State::Unverified) => Some(false),

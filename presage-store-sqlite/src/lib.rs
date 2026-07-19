@@ -12,11 +12,13 @@ use sqlx::{
     sqlite::{SqliteJournalMode, SqliteSynchronous},
 };
 
+mod client_identity;
 mod content;
 mod data;
 mod error;
 mod protocol;
 
+pub use client_identity::IdentityChangeNotice;
 pub use error::SqliteStoreError;
 pub use presage::model::identity::OnNewIdentity;
 pub use sqlx::sqlite::SqliteConnectOptions;
