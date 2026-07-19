@@ -18,10 +18,15 @@ use libsignal_service::{
     encrypt_device_name,
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
-    prelude::{phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage, Uuid},
+    prelude::{
+        phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage,
+        StorageServiceKey, Uuid,
+    },
     profile_cipher::ProfileCipher,
     proto::{
         data_message::Delete,
+        manifest_record::identifier,
+        storage_record,
         sync_message::{self, sticker_pack_operation, StickerPackOperation},
         AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage, SyncMessage,
         Verified,
@@ -45,7 +50,7 @@ use libsignal_service::{
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::ProfileKey,
     },
-    AccountManager, Profile, ServiceIdExt,
+    AccountManager, Profile, ServiceIdExt, StorageService,
 };
 use rand::rng;
 use serde::{Deserialize, Serialize};
@@ -63,6 +68,15 @@ pub use crate::model::messages::Received;
 
 type ServiceCipher<S> = cipher::ServiceCipher<S>;
 type MessageSender<S> = libsignal_service::prelude::MessageSender<S>;
+
+fn storage_group_item_keys(manifest: &libsignal_service::proto::ManifestRecord) -> Vec<Vec<u8>> {
+    manifest
+        .identifiers
+        .iter()
+        .filter(|identifier| identifier.r#type == identifier::Type::Groupv2 as i32)
+        .map(|identifier| identifier.raw.clone())
+        .collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistrationType {
@@ -575,6 +589,46 @@ impl<S: Store> Manager<S, Registered> {
         );
 
         Ok(groups_manager)
+    }
+
+    /// Fetches the account's current group records from Signal Storage Service
+    /// and refreshes their encrypted group metadata in the local store.
+    ///
+    /// Linked devices do not receive an authoritative legacy group snapshot.
+    /// Storage Service is therefore required to discover existing groups that
+    /// have not produced a message since this device was linked.
+    pub async fn synchronize_storage_groups(&mut self) -> Result<usize, Error<S::Error>> {
+        let master_key = self
+            .master_key()
+            .await?
+            .ok_or(Error::MissingKeyError("master key".into()))?;
+        let storage_key = StorageServiceKey::from_master_key(&master_key);
+        let storage = StorageService::new(self.identified_push_service(), storage_key).await?;
+        let manifest = storage.manifest().await?;
+        let group_item_keys = storage_group_item_keys(&manifest);
+        let record_ikm =
+            (!manifest.record_ikm.is_empty()).then_some(manifest.record_ikm.as_slice());
+        let records = storage.read_items(group_item_keys, record_ikm).await?;
+        let mut groups_manager = self.groups_manager().await?;
+        let mut synchronized = 0;
+
+        for record in records {
+            let Some(storage_record::Record::GroupV2(group)) = record.record else {
+                continue;
+            };
+            let Ok(master_key) = <[u8; 32]>::try_from(group.master_key) else {
+                warn!("ignoring a storage group with an invalid master key length");
+                continue;
+            };
+            if upsert_group(&self.store, &mut groups_manager, &master_key, &0)
+                .await?
+                .is_some()
+            {
+                synchronized += 1;
+            }
+        }
+
+        Ok(synchronized)
     }
 
     /// Starts receiving and storing messages.
@@ -2125,4 +2179,34 @@ async fn register_pre_keys<S: Store>(
 
     trace!("registered pre keys");
     Ok(())
+}
+
+#[cfg(test)]
+mod storage_group_tests {
+    use super::*;
+    use libsignal_service::proto::manifest_record::{identifier::Type, Identifier};
+    use libsignal_service::proto::ManifestRecord;
+
+    #[test]
+    fn selects_only_group_v2_storage_items() {
+        let manifest = ManifestRecord {
+            identifiers: vec![
+                Identifier {
+                    raw: vec![1],
+                    r#type: Type::Contact as i32,
+                },
+                Identifier {
+                    raw: vec![2],
+                    r#type: Type::Groupv2 as i32,
+                },
+                Identifier {
+                    raw: vec![3],
+                    r#type: Type::Groupv1 as i32,
+                },
+            ],
+            ..ManifestRecord::default()
+        };
+
+        assert_eq!(storage_group_item_keys(&manifest), vec![vec![2]]);
+    }
 }
