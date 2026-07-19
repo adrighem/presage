@@ -13,12 +13,14 @@ use sqlx::{
 };
 
 mod client_identity;
+mod client_outbox;
 mod content;
 mod data;
 mod error;
 mod protocol;
 
 pub use client_identity::IdentityChangeNotice;
+pub use client_outbox::{ClientOutboxKind, ClientOutboxMessage};
 pub use error::SqliteStoreError;
 pub use presage::model::identity::OnNewIdentity;
 pub use sqlx::sqlite::SqliteConnectOptions;
