@@ -21,6 +21,25 @@ use crate::{
     error::SqlxErrorExt,
 };
 
+const UPSERT_GROUP_SQL: &str = r#"
+    INSERT INTO groups (
+        master_key, title, revision, invite_link_password, access_control,
+        avatar, description, members, pending_members, requesting_members,
+        disappearing_messages_timer
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(master_key) DO UPDATE SET
+        title = excluded.title,
+        revision = excluded.revision,
+        invite_link_password = excluded.invite_link_password,
+        access_control = excluded.access_control,
+        avatar = excluded.avatar,
+        description = excluded.description,
+        members = excluded.members,
+        pending_members = excluded.pending_members,
+        requesting_members = excluded.requesting_members,
+        disappearing_messages_timer = excluded.disappearing_messages_timer
+"#;
+
 impl SqliteStore {
     /// Prepare durable per-client message projection tracking.
     ///
@@ -543,22 +562,80 @@ impl ContentsStore for SqliteStore {
     ) -> Result<(), Self::ContentsStoreError> {
         let g = SqlGroup::from_group(&master_key, group.into());
         let master_key = g.master_key.as_ref();
-        query!(
-            "INSERT OR REPLACE INTO groups VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            master_key,
-            g.title,
-            g.revision,
-            g.invite_link_password,
-            g.access_control,
-            g.avatar,
-            g.description,
-            g.members,
-            g.pending_members,
-            g.requesting_members,
-            g.disappearing_messages_timer,
-        )
-        .execute(&self.db)
-        .await?;
+        query(UPSERT_GROUP_SQL)
+            .bind(master_key)
+            .bind(g.title)
+            .bind(g.revision)
+            .bind(g.invite_link_password)
+            .bind(g.access_control)
+            .bind(g.avatar)
+            .bind(g.description)
+            .bind(g.members)
+            .bind(g.pending_members)
+            .bind(g.requesting_members)
+            .bind(g.disappearing_messages_timer)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_group(
+        &self,
+        master_key: GroupMasterKeyBytes,
+    ) -> Result<(), Self::ContentsStoreError> {
+        let mut transaction = self.db.begin().await.into_protocol_error()?;
+        let master_key = master_key.as_slice();
+        query("DELETE FROM group_avatars WHERE group_master_key = ?")
+            .bind(master_key)
+            .execute(&mut *transaction)
+            .await?;
+        query("DELETE FROM groups WHERE master_key = ?")
+            .bind(master_key)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await.into_protocol_error()?;
+        Ok(())
+    }
+
+    async fn reconcile_groups(
+        &self,
+        active_groups: Vec<(GroupMasterKeyBytes, Group)>,
+        stale_groups: Vec<GroupMasterKeyBytes>,
+    ) -> Result<(), Self::ContentsStoreError> {
+        let mut transaction = self.db.begin().await.into_protocol_error()?;
+
+        for (master_key, group) in active_groups {
+            let g = SqlGroup::from_group(&master_key, group);
+            let master_key = g.master_key.as_ref();
+            query(UPSERT_GROUP_SQL)
+                .bind(master_key)
+                .bind(g.title)
+                .bind(g.revision)
+                .bind(g.invite_link_password)
+                .bind(g.access_control)
+                .bind(g.avatar)
+                .bind(g.description)
+                .bind(g.members)
+                .bind(g.pending_members)
+                .bind(g.requesting_members)
+                .bind(g.disappearing_messages_timer)
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        for master_key in stale_groups {
+            let master_key = master_key.as_slice();
+            query("DELETE FROM group_avatars WHERE group_master_key = ?")
+                .bind(master_key)
+                .execute(&mut *transaction)
+                .await?;
+            query("DELETE FROM groups WHERE master_key = ?")
+                .bind(master_key)
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        transaction.commit().await.into_protocol_error()?;
         Ok(())
     }
 
@@ -874,13 +951,44 @@ mod tests {
     use presage::{
         libsignal_service::{
             content::{Content, ContentBody, DataMessage, Metadata},
+            groups_v2::Role,
+            prelude::ProfileKey,
             protocol::{Aci, DeviceId, ServiceId},
+            zkgroup::GroupMasterKeyBytes,
         },
+        model::groups::{Group, Member},
         store::{ContentsStore, Thread},
     };
+    use sqlx::query;
     use uuid::Uuid;
 
     use crate::{OnNewIdentity, SqliteStore};
+
+    fn group(member: Aci) -> Group {
+        group_with_title(member, "test group")
+    }
+
+    fn group_with_title(member: Aci, title: &str) -> Group {
+        Group {
+            title: title.into(),
+            avatar: "avatar/path".into(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 7,
+            members: vec![Member {
+                aci: member,
+                role: Role::Administrator,
+                profile_key: ProfileKey::create([7; 32]),
+                joined_at_revision: 1,
+                label: None,
+                label_emoji: None,
+            }],
+            pending_members: Vec::new(),
+            requesting_members: Vec::new(),
+            invite_link_password: Vec::new(),
+            description: None,
+        }
+    }
 
     fn message(sender: ServiceId, destination: ServiceId, timestamp: u64) -> Content {
         let datetime = Utc.timestamp_millis_opt(timestamp as i64).unwrap();
@@ -951,5 +1059,115 @@ mod tests {
 
         store.db.close().await;
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn removes_one_group_and_its_avatar() {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Reject)
+            .await
+            .unwrap();
+        let member = Aci::from(Uuid::from_u128(1));
+        let removed_key: GroupMasterKeyBytes = [1; 32];
+        let retained_key: GroupMasterKeyBytes = [2; 32];
+
+        store.save_group(removed_key, group(member)).await.unwrap();
+        let avatar = vec![1, 2, 3];
+        store.save_group_avatar(removed_key, &avatar).await.unwrap();
+        store.save_group(retained_key, group(member)).await.unwrap();
+
+        store.remove_group(removed_key).await.unwrap();
+
+        assert!(store.group(removed_key).await.unwrap().is_none());
+        assert!(store.group_avatar(removed_key).await.unwrap().is_none());
+        assert!(store.group(retained_key).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn reconciles_groups_and_avatars_atomically() {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Reject)
+            .await
+            .unwrap();
+        let member = Aci::from(Uuid::from_u128(1));
+        let active_key: GroupMasterKeyBytes = [1; 32];
+        let new_key: GroupMasterKeyBytes = [2; 32];
+        let stale_key: GroupMasterKeyBytes = [3; 32];
+        let avatar = vec![4, 5, 6];
+
+        store.save_group(active_key, group(member)).await.unwrap();
+        store.save_group_avatar(active_key, &avatar).await.unwrap();
+        store.save_group(stale_key, group(member)).await.unwrap();
+        store.save_group_avatar(stale_key, &avatar).await.unwrap();
+
+        store
+            .reconcile_groups(
+                vec![
+                    (active_key, group_with_title(member, "updated")),
+                    (new_key, group_with_title(member, "new")),
+                ],
+                vec![stale_key],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.group(active_key).await.unwrap().unwrap().title,
+            "updated"
+        );
+        assert_eq!(store.group_avatar(active_key).await.unwrap(), Some(avatar));
+        assert_eq!(store.group(new_key).await.unwrap().unwrap().title, "new");
+        assert!(store.group(stale_key).await.unwrap().is_none());
+        assert!(store.group_avatar(stale_key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rolls_back_a_failed_group_reconciliation() {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Reject)
+            .await
+            .unwrap();
+        let member = Aci::from(Uuid::from_u128(1));
+        let active_key: GroupMasterKeyBytes = [1; 32];
+        let stale_key: GroupMasterKeyBytes = [2; 32];
+        let failing_key: GroupMasterKeyBytes = [3; 32];
+        let avatar = vec![7, 8, 9];
+
+        store
+            .save_group(active_key, group_with_title(member, "original"))
+            .await
+            .unwrap();
+        store.save_group(stale_key, group(member)).await.unwrap();
+        store.save_group_avatar(stale_key, &avatar).await.unwrap();
+        store
+            .save_group(failing_key, group_with_title(member, "fail delete"))
+            .await
+            .unwrap();
+        store.save_group_avatar(failing_key, &avatar).await.unwrap();
+        query(
+            "CREATE TRIGGER fail_group_reconcile BEFORE DELETE ON groups \
+             WHEN OLD.title = 'fail delete' BEGIN \
+             SELECT RAISE(ABORT, 'forced reconcile failure'); END",
+        )
+        .execute(&store.db)
+        .await
+        .unwrap();
+
+        let result = store
+            .reconcile_groups(
+                vec![(active_key, group_with_title(member, "updated"))],
+                vec![stale_key, failing_key],
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            store.group(active_key).await.unwrap().unwrap().title,
+            "original"
+        );
+        assert!(store.group(stale_key).await.unwrap().is_some());
+        assert_eq!(
+            store.group_avatar(stale_key).await.unwrap(),
+            Some(avatar.clone())
+        );
+        assert!(store.group(failing_key).await.unwrap().is_some());
+        assert_eq!(store.group_avatar(failing_key).await.unwrap(), Some(avatar));
     }
 }

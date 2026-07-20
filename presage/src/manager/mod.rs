@@ -9,7 +9,7 @@ use std::{fmt, sync::Arc};
 
 pub use self::confirmation::Confirmation;
 pub use self::linking::Linking;
-pub use self::registered::{Registered, RegistrationData, RegistrationType};
+pub use self::registered::{LeaveGroupOutcome, Registered, RegistrationData, RegistrationType};
 pub use self::registration::{Registration, RegistrationOptions};
 
 /// Signal manager

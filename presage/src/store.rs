@@ -253,6 +253,25 @@ pub trait ContentsStore: Send + Sync {
         group: impl Into<Group>,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
+    /// Remove a single cached group and its cached avatar.
+    ///
+    /// Stored messages are intentionally retained so clients can continue to
+    /// display conversation history after leaving a group.
+    fn remove_group(
+        &self,
+        master_key: GroupMasterKeyBytes,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
+
+    /// Atomically save active groups and remove stale groups with their avatars.
+    ///
+    /// Implementations must leave the existing group cache unchanged if any
+    /// write in the reconciliation fails. Stored messages are retained.
+    fn reconcile_groups(
+        &self,
+        active_groups: Vec<(GroupMasterKeyBytes, Group)>,
+        stale_groups: Vec<GroupMasterKeyBytes>,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
+
     /// Get an iterator on all cached groups
     fn groups(&self) -> impl Future<Output = Result<Self::GroupsIter, Self::ContentsStoreError>>;
 

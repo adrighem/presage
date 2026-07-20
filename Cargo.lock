@@ -3127,6 +3127,7 @@ dependencies = [
  "quickcheck",
  "quickcheck_async",
  "rand 0.9.4",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",

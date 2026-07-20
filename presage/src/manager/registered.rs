@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
@@ -13,10 +14,13 @@ use libsignal_service::provisioning::ProvisioningSecrets;
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
     cipher,
-    configuration::{ServiceConfiguration, SignalServers},
+    configuration::{Endpoint, ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
-    groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
+    groups_v2::{
+        decrypt_group, GroupChange, GroupDecodingError, GroupOperations, GroupsManager,
+        InMemoryCredentialsCache,
+    },
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{
         phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage,
@@ -25,17 +29,18 @@ use libsignal_service::{
     profile_cipher::ProfileCipher,
     proto::{
         data_message::Delete,
+        group_change,
         manifest_record::identifier,
         storage_record,
         sync_message::{self, sticker_pack_operation, StickerPackOperation},
-        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage, SyncMessage,
-        Verified,
+        AttachmentPointer, DataMessage, EditMessage, GroupChangeResponse, GroupContextV2,
+        GroupResponse, NullMessage, SyncMessage, Verified,
     },
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
-    push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
+    push_service::{HttpAuthOverride, PushService, ServiceError, ServiceIds, DEFAULT_DEVICE_ID},
     receiver::MessageReceiver,
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
@@ -49,10 +54,12 @@ use libsignal_service::{
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::ProfileKey,
+        GroupMasterKeyBytes,
     },
     AccountManager, Profile, ServiceIdExt, StorageService,
 };
 use rand::rng;
+use reqwest::{header::HeaderMap, header::CONTENT_TYPE, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::sync::Mutex;
@@ -68,6 +75,9 @@ pub use crate::model::messages::Received;
 
 type ServiceCipher<S> = cipher::ServiceCipher<S>;
 type MessageSender<S> = libsignal_service::prelude::MessageSender<S>;
+const GROUP_LEAVE_REVISION_ATTEMPTS: usize = 3;
+const GROUPS_V2_ENDPOINT: &str = "/v2/groups/";
+const SIGNAL_TIMESTAMP_HEADER: &str = "x-signal-timestamp";
 
 fn storage_group_item_keys(manifest: &libsignal_service::proto::ManifestRecord) -> Vec<Vec<u8>> {
     manifest
@@ -78,10 +88,147 @@ fn storage_group_item_keys(manifest: &libsignal_service::proto::ManifestRecord) 
         .collect()
 }
 
+fn group_has_member(group: &libsignal_service::groups_v2::Group, aci: Aci) -> bool {
+    group.members.iter().any(|member| member.aci == aci)
+}
+
+fn stale_group_keys(
+    stored: impl IntoIterator<Item = GroupMasterKeyBytes>,
+    active: &HashSet<GroupMasterKeyBytes>,
+) -> Vec<GroupMasterKeyBytes> {
+    stored
+        .into_iter()
+        .filter(|key| !active.contains(key))
+        .collect()
+}
+
+fn build_leave_group_actions(
+    operations: &GroupOperations,
+    own_aci: Aci,
+    version: u32,
+) -> Result<group_change::Actions, GroupDecodingError> {
+    let own_uuid: Uuid = own_aci.into();
+    Ok(group_change::Actions {
+        // Requests carry the raw ACI. The group service replaces this with the
+        // encrypted service ID in the signed response.
+        source_user_id: own_uuid.as_bytes().to_vec(),
+        version,
+        delete_members: vec![operations.build_remove_member_action(own_aci)?],
+        ..Default::default()
+    })
+}
+
+fn signal_response_timestamp(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(SIGNAL_TIMESTAMP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthoritativeGroupResponse {
+    Current,
+    Inactive,
+    Error,
+}
+
+fn classify_authoritative_group_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Result<AuthoritativeGroupResponse, ServiceError> {
+    if signal_response_timestamp(headers).is_none() {
+        return Err(ServiceError::InvalidFrame {
+            reason: "groups v2 response had no valid timestamp",
+        });
+    }
+    if matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
+        Ok(AuthoritativeGroupResponse::Inactive)
+    } else if status.is_success() {
+        Ok(AuthoritativeGroupResponse::Current)
+    } else {
+        Ok(AuthoritativeGroupResponse::Error)
+    }
+}
+
+fn group_from_response(
+    response: GroupResponse,
+) -> Result<libsignal_service::proto::Group, ServiceError> {
+    response.group.ok_or(ServiceError::GroupsV2Error)
+}
+
+async fn groups_v2_response_error(response: reqwest::Response) -> ServiceError {
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED {
+        return ServiceError::Unauthorized;
+    }
+    let body = response.text().await.unwrap_or_default();
+    let body = body.chars().take(1024).collect();
+    ServiceError::UnhandledResponseCode { status, body }
+}
+
+async fn fetch_authoritative_group(
+    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    push_service: &PushService,
+    master_key: &GroupMasterKeyBytes,
+) -> Result<Option<libsignal_service::proto::Group>, ServiceError> {
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key));
+    let authorization = groups_manager
+        .get_authorization_for_today(&mut rand::rng(), secret_params)
+        .await?;
+    let response = push_service
+        .request(
+            Method::GET,
+            Endpoint::storage(GROUPS_V2_ENDPOINT),
+            HttpAuthOverride::Identified(authorization),
+        )?
+        .send()
+        .await
+        .map_err(ServiceError::from)?;
+
+    match classify_authoritative_group_response(response.status(), response.headers())? {
+        AuthoritativeGroupResponse::Inactive => return Ok(None),
+        AuthoritativeGroupResponse::Error => {
+            return Err(groups_v2_response_error(response).await);
+        }
+        AuthoritativeGroupResponse::Current => {}
+    }
+
+    let response = GroupResponse::decode(response.bytes().await?)?;
+    group_from_response(response).map(Some)
+}
+
+fn is_expected_leave_change(
+    change: &libsignal_service::groups_v2::GroupChanges,
+    expected_group_id: [u8; 32],
+    own_aci: Aci,
+    version: u32,
+) -> bool {
+    change.group_id == expected_group_id
+        && change.editor == own_aci
+        && change.version == version
+        && change
+            .changes
+            .iter()
+            .any(|item| matches!(item, GroupChange::DeleteMember(aci) if *aci == own_aci))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistrationType {
     Primary,
     Secondary,
+}
+
+/// Result details for a group leave accepted by the Signal group service.
+///
+/// Any returned value means membership was irreversibly removed on the server.
+/// The flags expose best-effort cleanup which callers may report as a nonfatal
+/// warning without restoring a group the account has already left. A peer
+/// notification is considered sent when no new leave change was required.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct LeaveGroupOutcome {
+    pub peer_notification_sent: bool,
+    pub local_group_removed: bool,
 }
 
 /// Manager state when the client is registered and can send and receive messages from Signal
@@ -606,29 +753,274 @@ impl<S: Store> Manager<S, Registered> {
         let storage = StorageService::new(self.identified_push_service(), storage_key).await?;
         let manifest = storage.manifest().await?;
         let group_item_keys = storage_group_item_keys(&manifest);
+        let expected_records = group_item_keys.len();
         let record_ikm =
             (!manifest.record_ikm.is_empty()).then_some(manifest.record_ikm.as_slice());
         let records = storage.read_items(group_item_keys, record_ikm).await?;
+        if records.len() != expected_records {
+            return Err(Error::IncompleteStorageGroupSnapshot);
+        }
+
         let mut groups_manager = self.groups_manager().await?;
-        let mut synchronized = 0;
+        let push_service = self.identified_push_service();
+        let own_aci = self.registration_data().service_ids.aci();
+        let mut seen = HashSet::new();
+        let mut active_groups = Vec::new();
 
         for record in records {
-            let Some(storage_record::Record::GroupV2(group)) = record.record else {
+            let Some(storage_record::Record::GroupV2(group_record)) = record.record else {
+                return Err(Error::InvalidStorageGroupRecord);
+            };
+            let master_key: GroupMasterKeyBytes = group_record
+                .master_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidStorageGroupRecord)?;
+            if !seen.insert(master_key) {
+                continue;
+            }
+
+            // Storage records do not carry a group revision. Always fetch the
+            // encrypted state so cached membership cannot make a departed group
+            // appear active forever.
+            let Some(encrypted) =
+                fetch_authoritative_group(&mut groups_manager, &push_service, &master_key).await?
+            else {
+                // A timestamp-bearing GroupsV2 403 or 404 definitively means
+                // this group is inactive. Other failures abort the refresh.
                 continue;
             };
-            let Ok(master_key) = <[u8; 32]>::try_from(group.master_key) else {
-                warn!("ignoring a storage group with an invalid master key length");
-                continue;
-            };
-            if upsert_group(&self.store, &mut groups_manager, &master_key, &0)
-                .await?
-                .is_some()
-            {
-                synchronized += 1;
+            let group = decrypt_group(&master_key, encrypted)?;
+            if group_has_member(&group, own_aci) {
+                active_groups.push((master_key, Group::from(group)));
             }
         }
 
+        // All network reads and decryptions above must succeed before the first
+        // store mutation. A partial remote snapshot therefore never prunes a
+        // previously valid local group.
+        let stored_keys = self
+            .store()
+            .groups()
+            .await?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        let active_keys = active_groups
+            .iter()
+            .map(|(key, _)| *key)
+            .collect::<HashSet<_>>();
+        let synchronized = active_keys.len();
+        let stale_keys = stale_group_keys(stored_keys, &active_keys);
+        self.store()
+            .reconcile_groups(active_groups, stale_keys)
+            .await?;
+
         Ok(synchronized)
+    }
+
+    /// Leave a GroupsV2 group and notify its remaining members.
+    ///
+    /// The current group state is fetched immediately before the authenticated
+    /// mutation. Revision conflicts are refreshed and retried. Once the group
+    /// service accepts the change, this method always returns `Ok`: notification
+    /// and local cleanup failures are reflected in [`LeaveGroupOutcome`] because
+    /// they cannot roll back the server-side membership change.
+    pub async fn leave_group(
+        &mut self,
+        master_key: &GroupMasterKeyBytes,
+    ) -> Result<LeaveGroupOutcome, Error<S::Error>> {
+        let own_aci = self.registration_data().service_ids.aci();
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key));
+        let expected_group_id = secret_params.get_group_identifier();
+        let operations = GroupOperations::new(secret_params);
+        let mut groups_manager = self.groups_manager().await?;
+        let push_service = self.identified_push_service();
+
+        for attempt in 0..GROUP_LEAVE_REVISION_ATTEMPTS {
+            let Some(encrypted) =
+                fetch_authoritative_group(&mut groups_manager, &push_service, master_key).await?
+            else {
+                return Ok(self.finish_already_left_group(master_key).await);
+            };
+            let current_group = decrypt_group(master_key, encrypted)?;
+            if !group_has_member(&current_group, own_aci) {
+                return Ok(self.finish_already_left_group(master_key).await);
+            }
+
+            let next_revision = current_group
+                .version
+                .checked_add(1)
+                .ok_or(Error::InvalidGroupLeaveChange)?;
+            let actions = build_leave_group_actions(&operations, own_aci, next_revision)
+                .map_err(ServiceError::from)?;
+            let authorization = groups_manager
+                .get_authorization_for_today(&mut rand::rng(), secret_params)
+                .await?;
+            let response = push_service
+                .request(
+                    Method::PATCH,
+                    Endpoint::storage(GROUPS_V2_ENDPOINT),
+                    HttpAuthOverride::Identified(authorization),
+                )?
+                .header(CONTENT_TYPE, "application/x-protobuf")
+                .body(actions.encode_to_vec())
+                .send()
+                .await
+                .map_err(ServiceError::from)?;
+
+            if response.status() == StatusCode::CONFLICT {
+                if attempt + 1 < GROUP_LEAVE_REVISION_ATTEMPTS {
+                    continue;
+                }
+                return Err(Error::GroupRevisionConflict);
+            }
+            if !response.status().is_success() {
+                return Err(groups_v2_response_error(response).await.into());
+            }
+            let notification_timestamp =
+                signal_response_timestamp(response.headers()).unwrap_or_else(|| {
+                    warn!("Signal group leave response had no valid X-Signal-Timestamp; using local time");
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64
+                });
+
+            let mut updated_group = Group::from(current_group);
+            updated_group.members.retain(|member| member.aci != own_aci);
+            updated_group.revision = next_revision;
+
+            let signed_change = match response.bytes().await {
+                Ok(bytes) => {
+                    let validation = (|| -> Result<_, ServiceError> {
+                        let response = GroupChangeResponse::decode(bytes)?;
+                        let signed = response.group_change.ok_or(ServiceError::GroupsV2Error)?;
+                        let signature = signed
+                            .server_signature
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| ServiceError::GroupsV2Error)?;
+                        self.state
+                            .service_configuration()
+                            .zkgroup_server_public_params
+                            .verify_signature(&signed.actions, signature)
+                            .map_err(ServiceError::from)?;
+                        let decoded = operations
+                            .decrypt_group_change(signed.clone())
+                            .map_err(ServiceError::from)?;
+                        if !is_expected_leave_change(
+                            &decoded,
+                            expected_group_id,
+                            own_aci,
+                            next_revision,
+                        ) {
+                            return Err(ServiceError::GroupsV2Error);
+                        }
+                        Ok(signed)
+                    })();
+                    match validation {
+                        Ok(change) => Some(change),
+                        Err(error) => {
+                            warn!(%error, "Signal accepted the group leave but returned an invalid signed change");
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "Signal accepted the group leave but its signed change could not be read");
+                    None
+                }
+            };
+
+            return Ok(self
+                .finish_accepted_group_leave(
+                    master_key,
+                    updated_group,
+                    next_revision,
+                    notification_timestamp,
+                    signed_change,
+                )
+                .await);
+        }
+
+        Err(Error::GroupRevisionConflict)
+    }
+
+    async fn finish_already_left_group(
+        &self,
+        master_key: &GroupMasterKeyBytes,
+    ) -> LeaveGroupOutcome {
+        let local_group_removed = match self.store().remove_group(*master_key).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "Signal group was already left but cached state could not be removed");
+                false
+            }
+        };
+        LeaveGroupOutcome {
+            peer_notification_sent: true,
+            local_group_removed,
+        }
+    }
+
+    async fn finish_accepted_group_leave(
+        &mut self,
+        master_key: &GroupMasterKeyBytes,
+        updated_group: Group,
+        revision: u32,
+        timestamp: u64,
+        signed_change: Option<libsignal_service::proto::GroupChange>,
+    ) -> LeaveGroupOutcome {
+        let prepared = match self.store().save_group(*master_key, updated_group).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "Signal group leave succeeded but updated state could not be saved");
+                false
+            }
+        };
+        let peer_notification_sent = if prepared {
+            if let Some(signed_change) = signed_change {
+                let message = DataMessage {
+                    timestamp: Some(timestamp),
+                    group_v2: Some(GroupContextV2 {
+                        master_key: Some(master_key.to_vec()),
+                        revision: Some(revision),
+                        group_change: Some(signed_change.encode_to_vec()),
+                    }),
+                    ..Default::default()
+                };
+                match self
+                    .send_message_to_group(master_key, message, timestamp)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(%error, "Signal group leave succeeded but remaining members could not be notified");
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let local_group_removed = match self.store().remove_group(*master_key).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "Signal group leave succeeded but cached state could not be removed");
+                false
+            }
+        };
+
+        LeaveGroupOutcome {
+            peer_notification_sent,
+            local_group_removed,
+        }
     }
 
     /// Starts receiving and storing messages.
@@ -2184,8 +2576,51 @@ async fn register_pre_keys<S: Store>(
 #[cfg(test)]
 mod storage_group_tests {
     use super::*;
+    use libsignal_service::groups_v2::{Group as ServiceGroup, Member as ServiceMember, Role};
     use libsignal_service::proto::manifest_record::{identifier::Type, Identifier};
-    use libsignal_service::proto::ManifestRecord;
+    use libsignal_service::proto::{GroupChange as ProtoGroupChange, ManifestRecord};
+    use reqwest::header::{HeaderName, HeaderValue};
+
+    fn aci(value: u128) -> Aci {
+        Aci::from(Uuid::from_u128(value))
+    }
+
+    fn service_group(members: &[Aci]) -> ServiceGroup {
+        ServiceGroup {
+            title: "test group".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            version: 4,
+            members: members
+                .iter()
+                .copied()
+                .map(|aci| ServiceMember {
+                    aci,
+                    role: Role::Default,
+                    profile_key: ProfileKey::create([3; 32]),
+                    joined_at_version: 1,
+                    label: None,
+                    label_emoji: None,
+                })
+                .collect(),
+            members_pending_profile_key: Vec::new(),
+            members_pending_admin_approval: Vec::new(),
+            invite_link_password: Vec::new(),
+            description_text: None,
+            announcements_only: false,
+            members_banned: Vec::new(),
+        }
+    }
+
+    fn timestamp_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(SIGNAL_TIMESTAMP_HEADER),
+            HeaderValue::from_static("123456789"),
+        );
+        headers
+    }
 
     #[test]
     fn selects_only_group_v2_storage_items() {
@@ -2208,5 +2643,142 @@ mod storage_group_tests {
         };
 
         assert_eq!(storage_group_item_keys(&manifest), vec![vec![2]]);
+    }
+
+    #[test]
+    fn filters_snapshots_to_active_self_membership() {
+        let own = aci(1);
+        assert!(group_has_member(&service_group(&[own, aci(2)]), own));
+        assert!(!group_has_member(&service_group(&[aci(2)]), own));
+        assert!(!group_has_member(&service_group(&[]), own));
+    }
+
+    #[test]
+    fn identifies_only_stale_stored_group_keys() {
+        let active = HashSet::from([[1; 32], [3; 32]]);
+        assert_eq!(
+            stale_group_keys([[1; 32], [2; 32], [3; 32]], &active),
+            vec![[2; 32]]
+        );
+    }
+
+    #[test]
+    fn builds_and_decodes_a_leave_change() {
+        assert_eq!(GROUPS_V2_ENDPOINT, "/v2/groups/");
+        let master_key = [9; 32];
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let operations = GroupOperations::new(secret_params);
+        let own = aci(1);
+        let own_uuid: Uuid = own.into();
+        let request = build_leave_group_actions(&operations, own, 8).unwrap();
+
+        assert_eq!(request.source_user_id.len(), 16);
+        assert_eq!(request.source_user_id, own_uuid.as_bytes());
+        assert!(request.group_id.is_empty());
+        assert_eq!(request.version, 8);
+        assert_eq!(request.delete_members.len(), 1);
+
+        // The service binds the response to the group and encrypts the editor
+        // before signing it. Recreate that response shape for decoder coverage.
+        let mut response_actions = request;
+        response_actions.group_id = secret_params.get_group_identifier().to_vec();
+        response_actions.source_user_id =
+            response_actions.delete_members[0].deleted_user_id.clone();
+        let response = ProtoGroupChange {
+            actions: response_actions.encode_to_vec(),
+            server_signature: vec![0; 64],
+            change_epoch: 0,
+        };
+        let decoded = operations.decrypt_group_change(response).unwrap();
+        assert!(is_expected_leave_change(
+            &decoded,
+            secret_params.get_group_identifier(),
+            own,
+            8
+        ));
+        assert!(!is_expected_leave_change(
+            &decoded,
+            secret_params.get_group_identifier(),
+            own,
+            9
+        ));
+    }
+
+    #[test]
+    fn reads_signal_group_change_timestamp() {
+        let mut headers = timestamp_headers();
+        assert_eq!(signal_response_timestamp(&headers), Some(123_456_789));
+
+        headers.insert(
+            HeaderName::from_static(SIGNAL_TIMESTAMP_HEADER),
+            HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(signal_response_timestamp(&headers), None);
+    }
+
+    #[test]
+    fn classifies_authoritative_group_responses() {
+        let headers = timestamp_headers();
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::OK, &headers).unwrap(),
+            AuthoritativeGroupResponse::Current
+        );
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::FORBIDDEN, &headers).unwrap(),
+            AuthoritativeGroupResponse::Inactive
+        );
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::NOT_FOUND, &headers).unwrap(),
+            AuthoritativeGroupResponse::Inactive
+        );
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::UNAUTHORIZED, &headers).unwrap(),
+            AuthoritativeGroupResponse::Error
+        );
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::LOCKED, &headers).unwrap(),
+            AuthoritativeGroupResponse::Error
+        );
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::INTERNAL_SERVER_ERROR, &headers)
+                .unwrap(),
+            AuthoritativeGroupResponse::Error
+        );
+    }
+
+    #[test]
+    fn rejects_departure_without_a_valid_timestamp() {
+        assert!(matches!(
+            classify_authoritative_group_response(StatusCode::FORBIDDEN, &HeaderMap::new()),
+            Err(ServiceError::InvalidFrame { .. })
+        ));
+        assert!(matches!(
+            classify_authoritative_group_response(StatusCode::NOT_FOUND, &HeaderMap::new()),
+            Err(ServiceError::InvalidFrame { .. })
+        ));
+
+        let mut headers = timestamp_headers();
+        headers.insert(
+            HeaderName::from_static(SIGNAL_TIMESTAMP_HEADER),
+            HeaderValue::from_static("invalid"),
+        );
+        assert!(matches!(
+            classify_authoritative_group_response(StatusCode::FORBIDDEN, &headers),
+            Err(ServiceError::InvalidFrame { .. })
+        ));
+    }
+
+    #[test]
+    fn requires_a_group_in_the_current_state_response() {
+        assert!(matches!(
+            group_from_response(GroupResponse::default()),
+            Err(ServiceError::GroupsV2Error)
+        ));
+        assert!(group_from_response(GroupResponse {
+            group: Some(libsignal_service::proto::Group::default()),
+            ..Default::default()
+        })
+        .is_ok());
     }
 }

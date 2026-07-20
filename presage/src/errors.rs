@@ -62,6 +62,14 @@ pub enum Error<S: std::error::Error> {
     AttachmentCipherError(#[from] libsignal_service::attachment_cipher::AttachmentCipherError),
     #[error("unknown group")]
     UnknownGroup,
+    #[error("Signal Storage Service returned an incomplete group snapshot")]
+    IncompleteStorageGroupSnapshot,
+    #[error("Signal Storage Service returned an invalid group record")]
+    InvalidStorageGroupRecord,
+    #[error("the Signal group revision changed too many times; retry the operation")]
+    GroupRevisionConflict,
+    #[error("Signal returned an invalid group leave change")]
+    InvalidGroupLeaveChange,
     #[error("unknown recipient")]
     UnknownRecipient,
     #[error("timeout: {0}")]
