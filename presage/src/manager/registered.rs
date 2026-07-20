@@ -159,6 +159,24 @@ fn active_group_from_snapshot(
     group_has_member(&group, own_aci).then(|| (master_key, Group::from(group)))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupLeaveConfirmationError {
+    StillMember,
+}
+
+fn confirmed_group_after_leave(
+    group: Option<libsignal_service::groups_v2::Group>,
+    own_aci: Aci,
+) -> Result<Option<Group>, GroupLeaveConfirmationError> {
+    match group {
+        Some(group) if group_has_member(&group, own_aci) => {
+            Err(GroupLeaveConfirmationError::StillMember)
+        }
+        Some(group) => Ok(Some(Group::from(group))),
+        None => Ok(None),
+    }
+}
+
 fn build_leave_group_actions(
     operations: &GroupOperations,
     own_aci: Aci,
@@ -889,10 +907,12 @@ impl<S: Store> Manager<S, Registered> {
     /// Leave a GroupsV2 group and notify its remaining members.
     ///
     /// The current group state is fetched immediately before the authenticated
-    /// mutation. Revision conflicts are refreshed and retried. Once the group
-    /// service accepts the change, this method always returns `Ok`: notification
-    /// and local cleanup failures are reflected in [`LeaveGroupOutcome`] because
-    /// they cannot roll back the server-side membership change.
+    /// mutation. Revision conflicts are refreshed and retried. A valid signed
+    /// change proves success directly. If that proof is unavailable, a second
+    /// authoritative read must confirm nonmembership before local state is
+    /// changed. Notification and local cleanup failures after confirmed success
+    /// are reflected in [`LeaveGroupOutcome`] because they cannot roll back the
+    /// server-side membership change.
     pub async fn leave_group(
         &mut self,
         master_key: &GroupMasterKeyBytes,
@@ -1000,6 +1020,20 @@ impl<S: Store> Manager<S, Registered> {
                     None
                 }
             };
+
+            if signed_change.is_none() {
+                let authoritative_group =
+                    fetch_authoritative_group(&mut groups_manager, &push_service, master_key)
+                        .await?
+                        .map(|encrypted| decrypt_group(master_key, encrypted))
+                        .transpose()?;
+                if let Some(confirmed_group) =
+                    confirmed_group_after_leave(authoritative_group, own_aci)
+                        .map_err(|_| Error::InvalidGroupLeaveChange)?
+                {
+                    updated_group = confirmed_group;
+                }
+            }
 
             return Ok(self
                 .finish_accepted_group_leave(
@@ -2803,6 +2837,35 @@ mod storage_group_tests {
         assert!(group_has_member(&service_group(&[own, aci(2)]), own));
         assert!(!group_has_member(&service_group(&[aci(2)]), own));
         assert!(!group_has_member(&service_group(&[]), own));
+    }
+
+    #[test]
+    fn confirms_leave_when_authoritative_group_is_inaccessible() {
+        let own = aci(1);
+
+        assert!(confirmed_group_after_leave(None, own).unwrap().is_none());
+    }
+
+    #[test]
+    fn confirms_leave_from_authoritative_nonmembership() {
+        let own = aci(1);
+        let other = aci(2);
+        let confirmed = confirmed_group_after_leave(Some(service_group(&[other])), own)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(confirmed.members.len(), 1);
+        assert_eq!(confirmed.members[0].aci, other);
+    }
+
+    #[test]
+    fn rejects_leave_confirmation_while_account_is_still_a_member() {
+        let own = aci(1);
+
+        assert!(matches!(
+            confirmed_group_after_leave(Some(service_group(&[own])), own),
+            Err(GroupLeaveConfirmationError::StillMember)
+        ));
     }
 
     #[test]
