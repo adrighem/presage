@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
@@ -34,7 +34,7 @@ use libsignal_service::{
         storage_record,
         sync_message::{self, sticker_pack_operation, StickerPackOperation},
         AttachmentPointer, DataMessage, EditMessage, GroupChangeResponse, GroupContextV2,
-        GroupResponse, NullMessage, SyncMessage, Verified,
+        GroupResponse, NullMessage, StorageRecord, SyncMessage, Verified,
     },
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
@@ -79,12 +79,54 @@ const GROUP_LEAVE_REVISION_ATTEMPTS: usize = 3;
 const GROUPS_V2_ENDPOINT: &str = "/v2/groups/";
 const SIGNAL_TIMESTAMP_HEADER: &str = "x-signal-timestamp";
 
-fn storage_group_item_keys(manifest: &libsignal_service::proto::ManifestRecord) -> Vec<Vec<u8>> {
-    manifest
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageGroupSnapshotError {
+    DuplicateManifestKey,
+    ResponseKeySetMismatch,
+}
+
+fn storage_group_item_keys(
+    manifest: &libsignal_service::proto::ManifestRecord,
+) -> Result<Vec<Vec<u8>>, StorageGroupSnapshotError> {
+    let keys = manifest
         .identifiers
         .iter()
         .filter(|identifier| identifier.r#type == identifier::Type::Groupv2 as i32)
         .map(|identifier| identifier.raw.clone())
+        .collect::<Vec<_>>();
+    let unique = keys.iter().collect::<HashSet<_>>();
+    if unique.len() != keys.len() {
+        return Err(StorageGroupSnapshotError::DuplicateManifestKey);
+    }
+    Ok(keys)
+}
+
+fn match_storage_group_records(
+    requested: &[Vec<u8>],
+    returned: Vec<(Vec<u8>, StorageRecord)>,
+) -> Result<Vec<StorageRecord>, StorageGroupSnapshotError> {
+    let requested_keys = requested.iter().cloned().collect::<HashSet<_>>();
+    if requested_keys.len() != requested.len() {
+        return Err(StorageGroupSnapshotError::DuplicateManifestKey);
+    }
+
+    let mut records = HashMap::with_capacity(returned.len());
+    for (key, record) in returned {
+        if !requested_keys.contains(&key) || records.insert(key, record).is_some() {
+            return Err(StorageGroupSnapshotError::ResponseKeySetMismatch);
+        }
+    }
+    if records.len() != requested.len() {
+        return Err(StorageGroupSnapshotError::ResponseKeySetMismatch);
+    }
+
+    requested
+        .iter()
+        .map(|key| {
+            records
+                .remove(key)
+                .ok_or(StorageGroupSnapshotError::ResponseKeySetMismatch)
+        })
         .collect()
 }
 
@@ -100,6 +142,21 @@ fn stale_group_keys(
         .into_iter()
         .filter(|key| !active.contains(key))
         .collect()
+}
+
+fn group_candidate_keys(
+    manifest: impl IntoIterator<Item = GroupMasterKeyBytes>,
+    cached: impl IntoIterator<Item = GroupMasterKeyBytes>,
+) -> HashSet<GroupMasterKeyBytes> {
+    manifest.into_iter().chain(cached).collect()
+}
+
+fn active_group_from_snapshot(
+    master_key: GroupMasterKeyBytes,
+    group: libsignal_service::groups_v2::Group,
+    own_aci: Aci,
+) -> Option<(GroupMasterKeyBytes, Group)> {
+    group_has_member(&group, own_aci).then(|| (master_key, Group::from(group)))
 }
 
 fn build_leave_group_actions(
@@ -752,20 +809,17 @@ impl<S: Store> Manager<S, Registered> {
         let storage_key = StorageServiceKey::from_master_key(&master_key);
         let storage = StorageService::new(self.identified_push_service(), storage_key).await?;
         let manifest = storage.manifest().await?;
-        let group_item_keys = storage_group_item_keys(&manifest);
-        let expected_records = group_item_keys.len();
+        let group_item_keys =
+            storage_group_item_keys(&manifest).map_err(|_| Error::InvalidStorageGroupRecord)?;
         let record_ikm =
             (!manifest.record_ikm.is_empty()).then_some(manifest.record_ikm.as_slice());
-        let records = storage.read_items(group_item_keys, record_ikm).await?;
-        if records.len() != expected_records {
-            return Err(Error::IncompleteStorageGroupSnapshot);
-        }
+        let returned = storage
+            .read_items_with_keys(group_item_keys.clone(), record_ikm)
+            .await?;
+        let records = match_storage_group_records(&group_item_keys, returned)
+            .map_err(|_| Error::IncompleteStorageGroupSnapshot)?;
 
-        let mut groups_manager = self.groups_manager().await?;
-        let push_service = self.identified_push_service();
-        let own_aci = self.registration_data().service_ids.aci();
-        let mut seen = HashSet::new();
-        let mut active_groups = Vec::new();
+        let mut manifest_group_keys = HashSet::new();
 
         for record in records {
             let Some(storage_record::Record::GroupV2(group_record)) = record.record else {
@@ -776,29 +830,11 @@ impl<S: Store> Manager<S, Registered> {
                 .as_slice()
                 .try_into()
                 .map_err(|_| Error::InvalidStorageGroupRecord)?;
-            if !seen.insert(master_key) {
-                continue;
-            }
-
-            // Storage records do not carry a group revision. Always fetch the
-            // encrypted state so cached membership cannot make a departed group
-            // appear active forever.
-            let Some(encrypted) =
-                fetch_authoritative_group(&mut groups_manager, &push_service, &master_key).await?
-            else {
-                // A timestamp-bearing GroupsV2 403 or 404 definitively means
-                // this group is inactive. Other failures abort the refresh.
-                continue;
-            };
-            let group = decrypt_group(&master_key, encrypted)?;
-            if group_has_member(&group, own_aci) {
-                active_groups.push((master_key, Group::from(group)));
+            if !manifest_group_keys.insert(master_key) {
+                return Err(Error::InvalidStorageGroupRecord);
             }
         }
 
-        // All network reads and decryptions above must succeed before the first
-        // store mutation. A partial remote snapshot therefore never prunes a
-        // previously valid local group.
         let stored_keys = self
             .store()
             .groups()
@@ -807,6 +843,36 @@ impl<S: Store> Manager<S, Registered> {
             .into_iter()
             .map(|(key, _)| key)
             .collect::<Vec<_>>();
+        let candidates = group_candidate_keys(
+            manifest_group_keys.iter().copied(),
+            stored_keys.iter().copied(),
+        );
+
+        let mut groups_manager = self.groups_manager().await?;
+        let push_service = self.identified_push_service();
+        let own_aci = self.registration_data().service_ids.aci();
+        let mut active_groups = Vec::new();
+
+        for master_key in candidates {
+            // Storage records do not carry a group revision. Always fetch the
+            // current group state for manifest and cached candidates so a
+            // manifest/group update race cannot drop an active group.
+            let Some(encrypted) =
+                fetch_authoritative_group(&mut groups_manager, &push_service, &master_key).await?
+            else {
+                // A timestamp-bearing GroupsV2 403 or 404 definitively means
+                // this group is inactive. Other failures abort the refresh.
+                continue;
+            };
+            let group = decrypt_group(&master_key, encrypted)?;
+            if let Some(active_group) = active_group_from_snapshot(master_key, group, own_aci) {
+                active_groups.push(active_group);
+            }
+        }
+
+        // All network reads and decryptions above must succeed before the first
+        // store mutation. A partial remote snapshot therefore never prunes a
+        // previously valid local group.
         let active_keys = active_groups
             .iter()
             .map(|(key, _)| *key)
@@ -2578,7 +2644,9 @@ mod storage_group_tests {
     use super::*;
     use libsignal_service::groups_v2::{Group as ServiceGroup, Member as ServiceMember, Role};
     use libsignal_service::proto::manifest_record::{identifier::Type, Identifier};
-    use libsignal_service::proto::{GroupChange as ProtoGroupChange, ManifestRecord};
+    use libsignal_service::proto::{
+        GroupChange as ProtoGroupChange, GroupV2Record, ManifestRecord, StorageRecord,
+    };
     use reqwest::header::{HeaderName, HeaderValue};
 
     fn aci(value: u128) -> Aci {
@@ -2622,6 +2690,15 @@ mod storage_group_tests {
         headers
     }
 
+    fn storage_group_record(value: u8) -> StorageRecord {
+        StorageRecord {
+            record: Some(storage_record::Record::GroupV2(GroupV2Record {
+                master_key: vec![value; 32],
+                ..Default::default()
+            })),
+        }
+    }
+
     #[test]
     fn selects_only_group_v2_storage_items() {
         let manifest = ManifestRecord {
@@ -2642,7 +2719,82 @@ mod storage_group_tests {
             ..ManifestRecord::default()
         };
 
-        assert_eq!(storage_group_item_keys(&manifest), vec![vec![2]]);
+        assert_eq!(storage_group_item_keys(&manifest).unwrap(), vec![vec![2]]);
+    }
+
+    #[test]
+    fn rejects_duplicate_group_keys_in_manifest() {
+        let manifest = ManifestRecord {
+            identifiers: vec![
+                Identifier {
+                    raw: vec![2],
+                    r#type: Type::Groupv2 as i32,
+                },
+                Identifier {
+                    raw: vec![2],
+                    r#type: Type::Groupv2 as i32,
+                },
+            ],
+            ..ManifestRecord::default()
+        };
+
+        assert_eq!(
+            storage_group_item_keys(&manifest),
+            Err(StorageGroupSnapshotError::DuplicateManifestKey)
+        );
+    }
+
+    #[test]
+    fn accepts_reordered_exact_storage_response_keys() {
+        let requested = vec![vec![1], vec![2]];
+        let records = match_storage_group_records(
+            &requested,
+            vec![
+                (vec![2], storage_group_record(2)),
+                (vec![1], storage_group_record(1)),
+            ],
+        )
+        .unwrap();
+
+        let master_keys = records
+            .into_iter()
+            .map(|record| match record.record.unwrap() {
+                storage_record::Record::GroupV2(group) => group.master_key,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(master_keys, vec![vec![1; 32], vec![2; 32]]);
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unrequested_storage_response_keys() {
+        let requested = vec![vec![1], vec![2]];
+
+        assert_eq!(
+            match_storage_group_records(&requested, vec![(vec![1], storage_group_record(1))]),
+            Err(StorageGroupSnapshotError::ResponseKeySetMismatch)
+        );
+        assert_eq!(
+            match_storage_group_records(
+                &requested,
+                vec![
+                    (vec![1], storage_group_record(1)),
+                    (vec![2], storage_group_record(2)),
+                    (vec![3], storage_group_record(3)),
+                ]
+            ),
+            Err(StorageGroupSnapshotError::ResponseKeySetMismatch)
+        );
+        assert_eq!(
+            match_storage_group_records(
+                &requested,
+                vec![
+                    (vec![1], storage_group_record(1)),
+                    (vec![1], storage_group_record(1)),
+                ]
+            ),
+            Err(StorageGroupSnapshotError::ResponseKeySetMismatch)
+        );
     }
 
     #[test]
@@ -2659,6 +2811,33 @@ mod storage_group_tests {
         assert_eq!(
             stale_group_keys([[1; 32], [2; 32], [3; 32]], &active),
             vec![[2; 32]]
+        );
+    }
+
+    #[test]
+    fn keeps_cached_manifest_absent_group_when_still_active() {
+        let manifest_key = [1; 32];
+        let cached_key = [2; 32];
+        let candidates = group_candidate_keys([manifest_key], [cached_key]);
+        assert_eq!(candidates, HashSet::from([manifest_key, cached_key]));
+
+        let own = aci(1);
+        let active = active_group_from_snapshot(cached_key, service_group(&[own]), own).unwrap();
+        let active_keys = HashSet::from([active.0]);
+        assert!(stale_group_keys([cached_key], &active_keys).is_empty());
+    }
+
+    #[test]
+    fn prunes_cached_manifest_absent_group_after_authoritative_nonmembership() {
+        let cached_key = [2; 32];
+        let candidates = group_candidate_keys([], [cached_key]);
+        assert_eq!(candidates, HashSet::from([cached_key]));
+
+        let own = aci(1);
+        assert!(active_group_from_snapshot(cached_key, service_group(&[aci(2)]), own).is_none());
+        assert_eq!(
+            stale_group_keys([cached_key], &HashSet::new()),
+            vec![cached_key]
         );
     }
 
