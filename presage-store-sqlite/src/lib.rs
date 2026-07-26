@@ -293,6 +293,33 @@ impl StateStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+
+    struct TestDatabase(PathBuf);
+
+    impl TestDatabase {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("presage-store-pool-{}.db3", rand::random::<u64>())),
+            )
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(format!("{}-shm", self.0.display()));
+            let _ = std::fs::remove_file(format!("{}-wal", self.0.display()));
+        }
+    }
 
     #[tokio::test]
     async fn sqlite_store_serializes_pool_access() {
@@ -301,6 +328,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.db.options().get_max_connections(), 1);
+        store.db.close().await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_queues_a_writer_behind_an_active_transaction() {
+        let database = TestDatabase::new();
+        let options = SqliteConnectOptions::new()
+            .filename(database.path())
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_millis(20));
+        let store = SqliteStore::open_with_options(options, OnNewIdentity::TrustUnverified)
+            .await
+            .unwrap();
+        let mut transaction = store.db.begin().await.unwrap();
+        query("INSERT OR REPLACE INTO kv (key, value) VALUES ('writer-a', X'01')")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        let mut second_write = Box::pin(
+            query("INSERT OR REPLACE INTO kv (key, value) VALUES ('writer-b', X'02')")
+                .execute(&store.db),
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second_write)
+                .await
+                .is_err()
+        );
+        transaction.commit().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), second_write)
+            .await
+            .unwrap()
+            .unwrap();
         store.db.close().await;
     }
 }
