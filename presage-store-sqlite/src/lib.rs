@@ -9,7 +9,7 @@ use presage::{
 use protocol::{IdentityType, SqliteProtocolStore};
 use sqlx::{
     SqlitePool, query, query_scalar,
-    sqlite::{SqliteJournalMode, SqliteSynchronous},
+    sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 
 mod client_identity;
@@ -66,7 +66,14 @@ impl SqliteStore {
         let options = options
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full);
-        let db = SqlitePool::connect_with(options).await?;
+        // Signal protocol state uses read-modify-write transactions. Multiple
+        // SQLite connections can race those transactions and return
+        // SQLITE_BUSY even with WAL and a busy timeout, so serialize access at
+        // the pool boundary.
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
 
         sqlx::migrate!().run(&db).await?;
         Ok(Self {
@@ -280,5 +287,20 @@ impl StateStore for SqliteStore {
                 .await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sqlite_store_serializes_pool_access() {
+        let store = SqliteStore::open("sqlite::memory:", OnNewIdentity::TrustUnverified)
+            .await
+            .unwrap();
+
+        assert_eq!(store.db.options().get_max_connections(), 1);
+        store.db.close().await;
     }
 }
