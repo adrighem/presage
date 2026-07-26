@@ -342,6 +342,13 @@ mod tests {
         let store = SqliteStore::open_with_options(options, OnNewIdentity::TrustUnverified)
             .await
             .unwrap();
+        if store.db.options().get_max_connections() > 1 {
+            let first_connection = store.db.acquire().await.unwrap();
+            let second_connection = store.db.acquire().await.unwrap();
+            drop(first_connection);
+            drop(second_connection);
+            assert!(store.db.size() >= 2);
+        }
         let mut transaction = store.db.begin().await.unwrap();
         query("INSERT OR REPLACE INTO kv (key, value) VALUES ('writer-a', X'01')")
             .execute(&mut *transaction)
