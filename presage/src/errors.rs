@@ -82,6 +82,10 @@ pub enum Error<S: std::error::Error> {
     RequestingCodeForbidden(RegistrationSessionMetadataResponse),
     #[error("attachment sha256 checksum did not match")]
     UnexpectedAttachmentChecksum,
+    #[error("attachment ciphertext has invalid framing")]
+    InvalidAttachmentCiphertext,
+    #[error("attachment exceeds the configured plaintext size limit of {max_size} bytes")]
+    AttachmentSizeLimitExceeded { max_size: usize },
     #[error("Unverified registration session (i.e. wrong verification code)")]
     UnverifiedRegistrationSession,
     #[error("profile cipher error")]

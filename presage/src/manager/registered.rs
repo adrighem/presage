@@ -5,7 +5,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
-use futures::{future, AsyncReadExt, Stream, StreamExt};
+use futures::future::LocalBoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{future, AsyncReadExt, FutureExt, Stream, StreamExt};
 use libsignal_service::libsignal_account_keys::AccountEntropyPool;
 use libsignal_service::prelude::SessionStoreExt;
 use libsignal_service::proto::addressable_message::Author;
@@ -68,7 +70,9 @@ use url::Url;
 
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
-use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
+use crate::store::{
+    ContentExt, ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread,
+};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
 pub use crate::model::messages::Received;
@@ -78,6 +82,149 @@ type MessageSender<S> = libsignal_service::prelude::MessageSender<S>;
 const GROUP_LEAVE_REVISION_ATTEMPTS: usize = 3;
 const GROUPS_V2_ENDPOINT: &str = "/v2/groups/";
 const SIGNAL_TIMESTAMP_HEADER: &str = "x-signal-timestamp";
+const ATTACHMENT_MIN_PADDED_PLAINTEXT_SIZE: u128 = 541;
+const ATTACHMENT_PRIVACY_PADDING_DENOMINATOR: u128 = 20;
+const ATTACHMENT_CIPHER_BLOCK_SIZE: u128 = 16;
+const ATTACHMENT_IV_SIZE: u128 = 16;
+const ATTACHMENT_MAC_SIZE: u128 = 32;
+const ATTACHMENT_MIN_CIPHERTEXT_SIZE: usize = 64;
+const CONTACT_PROFILE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProfileUpdateObservation {
+    sequence: u64,
+    profile_key: [u8; 32],
+}
+
+#[derive(Clone)]
+struct ContactProfileUpdate {
+    sender: ServiceId,
+    profile_key: ProfileKey,
+    observation_timestamp: u64,
+    expire_timer: u32,
+    expire_timer_version: u32,
+}
+
+#[derive(Clone)]
+struct QueuedContactProfileUpdate {
+    update: ContactProfileUpdate,
+    observation: ProfileUpdateObservation,
+}
+
+#[derive(Default)]
+struct ContactUpdateCoordinatorState {
+    locks: HashMap<Uuid, Arc<Mutex<()>>>,
+    latest_profile_updates: HashMap<Uuid, ProfileUpdateObservation>,
+    pending_profile_updates: HashMap<Uuid, QueuedContactProfileUpdate>,
+    next_profile_update_sequence: u64,
+}
+
+#[derive(Clone, Default)]
+struct ContactUpdateCoordinator {
+    inner: Arc<Mutex<ContactUpdateCoordinatorState>>,
+}
+
+impl ContactUpdateCoordinator {
+    async fn contact_lock(&self, uuid: Uuid) -> Arc<Mutex<()>> {
+        let mut state = self.inner.lock().await;
+        state.locks.entry(uuid).or_default().clone()
+    }
+
+    async fn enqueue_profile_update(&self, uuid: Uuid, update: ContactProfileUpdate) {
+        let contact_lock = self.contact_lock(uuid).await;
+        let _contact_guard = contact_lock.lock().await;
+        let mut state = self.inner.lock().await;
+        state.next_profile_update_sequence = state
+            .next_profile_update_sequence
+            .checked_add(1)
+            .expect("contact profile update sequence was exhausted");
+        let observation = ProfileUpdateObservation {
+            sequence: state.next_profile_update_sequence,
+            profile_key: update.profile_key.bytes,
+        };
+        state.latest_profile_updates.insert(uuid, observation);
+        state.pending_profile_updates.insert(
+            uuid,
+            QueuedContactProfileUpdate {
+                update,
+                observation,
+            },
+        );
+    }
+
+    async fn take_profile_update(&self, uuid: Uuid) -> Option<QueuedContactProfileUpdate> {
+        self.inner
+            .lock()
+            .await
+            .pending_profile_updates
+            .remove(&uuid)
+    }
+
+    async fn has_pending_profile_update(&self, uuid: Uuid) -> bool {
+        self.inner
+            .lock()
+            .await
+            .pending_profile_updates
+            .contains_key(&uuid)
+    }
+
+    async fn coalesce_current_profile_update(
+        &self,
+        uuid: Uuid,
+        queued: QueuedContactProfileUpdate,
+    ) -> Option<QueuedContactProfileUpdate> {
+        let mut state = self.inner.lock().await;
+        let current = *state.latest_profile_updates.get(&uuid)?;
+        if current.profile_key != queued.update.profile_key.bytes {
+            return None;
+        }
+        if state
+            .pending_profile_updates
+            .get(&uuid)
+            .is_some_and(|pending| pending.observation == current)
+        {
+            return state.pending_profile_updates.remove(&uuid);
+        }
+        (current == queued.observation).then_some(queued)
+    }
+}
+
+#[derive(Default)]
+struct ContactProfileWorkerQueue {
+    workers: FuturesUnordered<LocalBoxFuture<'static, Uuid>>,
+    active: HashSet<Uuid>,
+}
+
+impl ContactProfileWorkerQueue {
+    fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
+    fn start<S: Store>(
+        &mut self,
+        store: S,
+        identified_websocket: SignalWebSocket<websocket::Identified>,
+        contact_updates: ContactUpdateCoordinator,
+        sender_uuid: Uuid,
+    ) {
+        if self.active.insert(sender_uuid) {
+            self.workers.push(
+                run_contact_profile_worker(
+                    store,
+                    identified_websocket,
+                    contact_updates,
+                    sender_uuid,
+                )
+                .map(move |_| sender_uuid)
+                .boxed_local(),
+            );
+        }
+    }
+
+    fn complete(&mut self, sender_uuid: Uuid) {
+        self.active.remove(&sender_uuid);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StorageGroupSnapshotError {
@@ -313,6 +460,7 @@ pub struct Registered {
     pub(crate) identified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Identified>>>>,
     pub(crate) unidentified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Unidentified>>>>,
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
+    contact_updates: ContactUpdateCoordinator,
 
     pub(crate) data: RegistrationData,
 }
@@ -331,6 +479,7 @@ impl Registered {
             identified_websocket: Default::default(),
             unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
+            contact_updates: Default::default(),
             data,
         }
     }
@@ -1135,6 +1284,9 @@ impl<S: Store> Manager<S, Registered> {
     ) -> Result<impl Stream<Item = Received>, Error<S::Error>> {
         struct StreamState<Receiver, Store, AciStore, PniStore> {
             store: Store,
+            contact_updates: ContactUpdateCoordinator,
+            profile_workers: ContactProfileWorkerQueue,
+            queue_empty_pending: bool,
             identified_websocket: SignalWebSocket<websocket::Identified>,
             unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
             encrypted_messages: Receiver,
@@ -1187,6 +1339,9 @@ impl<S: Store> Manager<S, Registered> {
 
         let init = StreamState {
             store: self.store.clone(),
+            contact_updates: self.state.contact_updates.clone(),
+            profile_workers: ContactProfileWorkerQueue::default(),
+            queue_empty_pending: false,
             identified_websocket,
             unidentified_websocket: self.unidentified_websocket().await?,
             encrypted_messages: Box::pin(encrypted_messages.stream()),
@@ -1206,7 +1361,37 @@ impl<S: Store> Manager<S, Registered> {
         let incoming_messages_stream = futures::stream::unfold(init, |mut state| {
             async move {
                 loop {
-                    match state.encrypted_messages.next().await {
+                    if state.queue_empty_pending && state.profile_workers.is_empty() {
+                        state.queue_empty_pending = false;
+                        return Some((Received::QueueEmpty, state));
+                    }
+
+                    let incoming = if state.profile_workers.is_empty() {
+                        state.encrypted_messages.next().await
+                    } else {
+                        tokio::select! {
+                            biased;
+                            completed = state.profile_workers.workers.next() => {
+                                if let Some(sender_uuid) = completed {
+                                    state.profile_workers.complete(sender_uuid);
+                                    if state.contact_updates
+                                        .has_pending_profile_update(sender_uuid)
+                                        .await
+                                    {
+                                        state.profile_workers.start(
+                                            state.store.clone(),
+                                            state.identified_websocket.clone(),
+                                            state.contact_updates.clone(),
+                                            sender_uuid,
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                            incoming = state.encrypted_messages.next() => incoming,
+                        }
+                    };
+                    match incoming {
                         Some(Ok(Incoming::Envelope(envelope))) => {
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
@@ -1359,10 +1544,12 @@ impl<S: Store> Manager<S, Registered> {
                                             Ok(contacts) => {
                                                 info!("saving contacts");
                                                 for contact in contacts.filter_map(Result::ok) {
-                                                    if let Err(error) = state
-                                                        .store
-                                                        .save_contact(&contact.into())
-                                                        .await
+                                                    if let Err(error) = save_synchronized_contact(
+                                                        &mut state.store,
+                                                        &state.contact_updates,
+                                                        contact,
+                                                    )
+                                                    .await
                                                     {
                                                         warn!(%error, "failed to save contacts");
                                                         break;
@@ -1544,6 +1731,8 @@ impl<S: Store> Manager<S, Registered> {
                                     if let Err(error) = save_message(
                                         &mut state.store,
                                         &mut state.identified_websocket,
+                                        &state.contact_updates,
+                                        Some(&mut state.profile_workers),
                                         content.clone(),
                                         None,
                                     )
@@ -1564,7 +1753,7 @@ impl<S: Store> Manager<S, Registered> {
                         }
                         Some(Ok(Incoming::QueueEmpty)) => {
                             debug!("got empty queue");
-                            if state.account_entropy_pool.is_none() {
+                            if !state.queue_empty_pending && state.account_entropy_pool.is_none() {
                                 debug!("device does not have the needed keys; requesting from primary device");
 
                                 let mut message_sender = state.message_sender.clone();
@@ -1584,6 +1773,10 @@ impl<S: Store> Manager<S, Registered> {
                                         warn!(%error, "Error sending blocked contacts to other devices");
                                     }
                                 });
+                            }
+                            if !state.profile_workers.is_empty() {
+                                state.queue_empty_pending = true;
+                                continue;
                             }
                             return Some((Received::QueueEmpty, state));
                         }
@@ -1722,6 +1915,8 @@ impl<S: Store> Manager<S, Registered> {
         save_message(
             &mut self.store,
             &mut identified_websocket,
+            &self.state.contact_updates,
+            None,
             content,
             Some(thread),
         )
@@ -1850,6 +2045,8 @@ impl<S: Store> Manager<S, Registered> {
         save_message(
             &mut self.store,
             &mut identified_websocket,
+            &self.state.contact_updates,
+            None,
             content,
             Some(thread),
         )
@@ -1895,24 +2092,65 @@ impl<S: Store> Manager<S, Registered> {
         &self,
         attachment_pointer: &AttachmentPointer,
     ) -> Result<Vec<u8>, Error<S::Error>> {
+        self.get_attachment_inner(attachment_pointer, None).await
+    }
+
+    /// Downloads and decrypts a single attachment, rejecting it when its plaintext exceeds
+    /// `max_size`.
+    ///
+    /// The download itself is bounded to include Signal's privacy padding and attachment
+    /// encryption overhead. The encrypted stream is stopped as soon as it exceeds that bound.
+    pub async fn get_attachment_with_size_limit(
+        &self,
+        attachment_pointer: &AttachmentPointer,
+        max_size: usize,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
+        self.get_attachment_inner(attachment_pointer, Some(max_size))
+            .await
+    }
+
+    async fn get_attachment_inner(
+        &self,
+        attachment_pointer: &AttachmentPointer,
+        max_size: Option<usize>,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
         let expected_digest = attachment_pointer
             .digest
             .as_ref()
             .ok_or_else(|| Error::UnexpectedAttachmentChecksum)?;
 
+        let plaintext_len = attachment_pointer.size.and_then(|len| len.try_into().ok());
+        if let (Some(max_size), Some(plaintext_len)) = (max_size, plaintext_len) {
+            if plaintext_len > max_size {
+                return Err(Error::AttachmentSizeLimitExceeded { max_size });
+            }
+        }
+
         let mut service = self.identified_push_service();
         let mut attachment_stream = service.get_attachment(attachment_pointer).await?;
 
-        let plaintext_len = attachment_pointer.size.and_then(|len| len.try_into().ok());
-
         // We need the whole file for the crypto to check out
-        let mut ciphertext = Vec::with_capacity(plaintext_len.unwrap_or(0));
-        let size_bytes = attachment_stream.read_to_end(&mut ciphertext).await?;
+        let ciphertext_limit = max_size.map(attachment_ciphertext_size_limit);
+        let Some(mut ciphertext) = read_attachment_ciphertext(
+            &mut attachment_stream,
+            plaintext_len.unwrap_or(0),
+            ciphertext_limit,
+        )
+        .await?
+        else {
+            return Err(Error::AttachmentSizeLimitExceeded {
+                max_size: max_size.expect("ciphertext limit requires plaintext limit"),
+            });
+        };
+        let size_bytes = ciphertext.len();
         trace!(size_bytes, "downloaded encrypted attachment");
 
         let digest = sha2::Sha256::digest(&ciphertext);
         if &digest[..] != expected_digest {
             return Err(Error::UnexpectedAttachmentChecksum);
+        }
+        if !is_valid_attachment_ciphertext_size(ciphertext.len()) {
+            return Err(Error::InvalidAttachmentCiphertext);
         }
 
         let key: [u8; 64] = attachment_pointer.key().try_into()?;
@@ -1934,6 +2172,12 @@ impl<S: Store> Manager<S, Registered> {
             if len < ciphertext.len() {
                 // remove padding
                 ciphertext.truncate(len);
+            }
+        }
+
+        if let Some(max_size) = max_size {
+            if ciphertext.len() > max_size {
+                return Err(Error::AttachmentSizeLimitExceeded { max_size });
             }
         }
 
@@ -2214,6 +2458,62 @@ impl<S: Store> Manager<S, Registered> {
     }
 }
 
+fn attachment_ciphertext_size_limit(max_plaintext_size: usize) -> usize {
+    let max_plaintext_size = max_plaintext_size as u128;
+    // Signal pads to the next 5% privacy bucket, with a minimum padded size of 541 bytes.
+    // Adding a full 5% is a conservative upper bound for that bucket.
+    let privacy_padded_size = max_plaintext_size
+        .saturating_add(max_plaintext_size.div_ceil(ATTACHMENT_PRIVACY_PADDING_DENOMINATOR))
+        .max(ATTACHMENT_MIN_PADDED_PLAINTEXT_SIZE);
+    // Attachments contain a 16-byte IV, PKCS#7 padded AES-CBC ciphertext, and a 32-byte MAC.
+    // PKCS#7 always appends at least one byte, including a full block for block-aligned input.
+    let encrypted_size = ATTACHMENT_IV_SIZE
+        .saturating_add(
+            privacy_padded_size
+                .saturating_div(ATTACHMENT_CIPHER_BLOCK_SIZE)
+                .saturating_add(1)
+                .saturating_mul(ATTACHMENT_CIPHER_BLOCK_SIZE),
+        )
+        .saturating_add(ATTACHMENT_MAC_SIZE);
+
+    usize::try_from(encrypted_size).unwrap_or(usize::MAX)
+}
+
+fn is_valid_attachment_ciphertext_size(ciphertext_size: usize) -> bool {
+    let unencrypted_overhead = (ATTACHMENT_IV_SIZE + ATTACHMENT_MAC_SIZE) as usize;
+    ciphertext_size >= ATTACHMENT_MIN_CIPHERTEXT_SIZE
+        && (ciphertext_size - unencrypted_overhead)
+            .is_multiple_of(ATTACHMENT_CIPHER_BLOCK_SIZE as usize)
+}
+
+async fn read_attachment_ciphertext<R>(
+    reader: &mut R,
+    initial_capacity: usize,
+    max_ciphertext_size: Option<usize>,
+) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: futures::AsyncRead + Unpin,
+{
+    let initial_capacity = max_ciphertext_size
+        .map(|limit| initial_capacity.min(limit))
+        .unwrap_or(initial_capacity);
+    let mut ciphertext = Vec::with_capacity(initial_capacity);
+
+    if let Some(max_ciphertext_size) = max_ciphertext_size {
+        let read_limit = u64::try_from(max_ciphertext_size)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        reader.take(read_limit).read_to_end(&mut ciphertext).await?;
+        if ciphertext.len() > max_ciphertext_size {
+            return Ok(None);
+        }
+    } else {
+        reader.read_to_end(&mut ciphertext).await?;
+    }
+
+    Ok(Some(ciphertext))
+}
+
 /// Set the timestamp in any DataMessage so it matches its envelope's
 fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64) {
     match content_body {
@@ -2360,11 +2660,16 @@ async fn download_sticker<C: ContentsStore>(
 async fn save_message<S: Store>(
     store: &mut S,
     identified_websocket: &mut websocket::SignalWebSocket<websocket::Identified>,
+    contact_updates: &ContactUpdateCoordinator,
+    mut profile_workers: Option<&mut ContactProfileWorkerQueue>,
     message: Content,
     override_thread: Option<Thread>,
 ) -> Result<(), Error<S::Error>> {
     // derive the thread from the message type
+    let should_update_contact_profile = override_thread.is_none() && profile_workers.is_some();
     let thread = override_thread.unwrap_or(Thread::try_from(&message)?);
+    let profile_update_timestamp = message.timestamp();
+    let mut contact_profile_update = None;
 
     // only save DataMessage and SynchronizeMessage (sent)
     let message = match message.body {
@@ -2392,38 +2697,29 @@ async fn save_message<S: Store>(
             ..
         }) => {
             // update recipient profile key if changed
-            if let Some(profile_key_bytes) = profile_key.clone().and_then(|p| p.try_into().ok()) {
-                let sender = message.metadata.sender;
-                let profile_key = ProfileKey::create(profile_key_bytes);
-                debug!(sender = %sender.service_id_string(), "inserting profile key for");
+            if should_update_contact_profile {
+                if let Some(profile_key_bytes) = profile_key.clone().and_then(|p| p.try_into().ok())
+                {
+                    let sender = message.metadata.sender;
+                    let profile_key = ProfileKey::create(profile_key_bytes);
+                    debug!(sender = %sender.service_id_string(), "inserting profile key for");
 
-                // Either:
-                // - insert a new contact with the profile information
-                // - update the contact if the profile key has changed
-                // TODO: mark this contact as "created by us" maybe to know whether we should update it or not
-                // NOTE: this needs to happen in the background!
-                let store_inner = store.clone();
-                let websocket_inner = identified_websocket.clone();
-                let data_message_inner = data_message.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = upsert_contact_from_profile(
-                        store_inner,
-                        websocket_inner,
-                        &data_message_inner,
+                    contact_profile_update = Some(ContactProfileUpdate {
                         sender,
                         profile_key,
-                    )
-                    .await
-                    {
-                        error!(%error, "failed to upsert newly seen contact!");
-                    }
-                });
+                        observation_timestamp: profile_update_timestamp,
+                        expire_timer: data_message.expire_timer.unwrap_or_default(),
+                        expire_timer_version: data_message.expire_timer_version.unwrap_or(1),
+                    });
+                }
             }
 
             // Note: The expire timer fields of data messages are only for contacts.
             // Expire timers are handled for groups via upsert_group due to a revision change.
-            if let Thread::Contact(_) = thread {
+            if let Thread::Contact(service_id) = &thread {
                 let version = data_message.expire_timer_version.unwrap_or(1);
+                let contact_lock = contact_updates.contact_lock(service_id.raw_uuid()).await;
+                let _contact_guard = contact_lock.lock().await;
                 store
                     .update_expire_timer(
                         &thread,
@@ -2551,59 +2847,330 @@ async fn save_message<S: Store>(
         store.save_message(&thread, message).await?;
     }
 
+    // Contact data is persisted before optional profile enrichment. One local worker per contact
+    // coalesces observations without delaying message delivery.
+    if let Some(profile_update) = contact_profile_update {
+        let Some(aci) = profile_update.sender.aci() else {
+            debug!("not storing profile for PNI contact");
+            return Ok(());
+        };
+        let sender_uuid: Uuid = aci.into();
+        contact_updates
+            .enqueue_profile_update(sender_uuid, profile_update)
+            .await;
+        if let Some(profile_workers) = profile_workers.as_deref_mut() {
+            profile_workers.start(
+                store.clone(),
+                identified_websocket.clone(),
+                contact_updates.clone(),
+                sender_uuid,
+            );
+        }
+    }
+
     Ok(())
 }
 
-async fn upsert_contact_from_profile<S: Store>(
-    mut store: S,
-    mut identified_websocket: SignalWebSocket<websocket::Identified>,
-    data_message: &DataMessage,
-    sender: ServiceId,
-    profile_key: ProfileKey,
-) -> Result<(), Error<<S as Store>::Error>> {
-    if store.contact_by_id(&sender).await?.is_none()
-        || store
-            .profile_key(&sender)
-            .await?
-            .is_none_or(|p| p.bytes != profile_key.bytes)
-    {
-        if let Some(aci) = sender.aci() {
-            let sender_uuid: Uuid = aci.into();
-            let encrypted_profile = identified_websocket
-                .retrieve_profile_by_id(aci, Some(profile_key))
-                .await?;
-            let profile_cipher = ProfileCipher::new(profile_key);
-            let decrypted_profile = profile_cipher.decrypt(encrypted_profile).unwrap();
+fn profile_display_name(profile: &Profile) -> String {
+    profile
+        .name
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default()
+}
 
-            let contact = Contact {
-                uuid: sender_uuid,
-                phone_number: None,
-                name: decrypted_profile
-                    .name
-                    // FIXME: this assumes [firstname] [lastname]
-                    .map(|pn| {
-                        if let Some(family_name) = pn.family_name {
-                            format!("{} {}", pn.given_name, family_name)
-                        } else {
-                            pn.given_name
-                        }
-                    })
-                    .unwrap_or_default(),
-                profile_key: profile_key.bytes.to_vec(),
-                expire_timer: data_message.expire_timer.unwrap_or_default(),
-                expire_timer_version: data_message.expire_timer_version.unwrap_or(1),
-                inbox_position: 0,
-                avatar: None,
-                verified: Verified::default(),
-            };
+fn merge_synchronized_contact(
+    mut synchronized: Contact,
+    existing: Option<Contact>,
+    stored_profile_key: Option<ProfileKey>,
+    stored_profile: Option<&Profile>,
+) -> Contact {
+    let existing = existing.as_ref();
 
-            info!(%sender_uuid, "saved contact on first sight");
-            store.save_contact(&contact).await?;
-            store.upsert_profile_key(&sender_uuid, profile_key).await?;
+    if synchronized.name.is_empty() {
+        let cached_profile_name = stored_profile
+            .map(profile_display_name)
+            .filter(|name| !name.is_empty());
+        let legacy_profile_name = if stored_profile.is_none() {
+            existing
+                .filter(|contact| {
+                    contact.phone_number.is_none()
+                        && contact.profile_key.len() == 32
+                        && stored_profile_key.as_ref().is_some_and(|profile_key| {
+                            contact.profile_key.as_slice() == profile_key.bytes.as_slice()
+                        })
+                })
+                .map(|contact| contact.name.clone())
+                .filter(|name| !name.is_empty())
         } else {
-            debug!("not storing profile for PNI contact");
+            None
+        };
+        if let Some(name) = cached_profile_name.or(legacy_profile_name) {
+            synchronized.name = name;
         }
     }
+
+    if let Some(existing) = existing {
+        synchronized.verified = existing.verified.clone();
+    }
+    synchronized.profile_key = stored_profile_key
+        .map(|profile_key| profile_key.bytes.to_vec())
+        .or_else(|| {
+            existing
+                .filter(|contact| contact.profile_key.len() == 32)
+                .map(|contact| contact.profile_key.clone())
+        })
+        .unwrap_or_default();
+
+    synchronized
+}
+
+async fn save_synchronized_contact<S: Store>(
+    store: &mut S,
+    contact_updates: &ContactUpdateCoordinator,
+    contact: libsignal_service::models::Contact,
+) -> Result<(), S::Error> {
+    let synchronized: Contact = contact.into();
+    let uuid = synchronized.uuid;
+    let contact_lock = contact_updates.contact_lock(uuid).await;
+    let _contact_guard = contact_lock.lock().await;
+    let service_id = ServiceId::Aci(Aci::from(uuid));
+    let existing = store.contact_by_id(&service_id).await?;
+    let stored_profile_key = store.profile_key(&service_id).await?;
+    let stored_profile = match (synchronized.name.is_empty(), stored_profile_key) {
+        (true, Some(profile_key)) => store.profile(uuid, profile_key).await?,
+        _ => None,
+    };
+    let contact = merge_synchronized_contact(
+        synchronized,
+        existing,
+        stored_profile_key,
+        stored_profile.as_ref(),
+    );
+    store.save_contact(&contact).await
+}
+
+fn needs_profile_contact_upsert(
+    contact: Option<&Contact>,
+    stored_profile_key: Option<&ProfileKey>,
+    incoming_profile_key: &ProfileKey,
+) -> bool {
+    stored_profile_key != Some(incoming_profile_key)
+        || contact.is_none_or(|contact| {
+            contact.name.is_empty()
+                || contact.profile_key.as_slice() != incoming_profile_key.bytes.as_slice()
+        })
+}
+
+fn merge_profile_contact(
+    uuid: Uuid,
+    existing: Option<Contact>,
+    previous_profile: Option<&Profile>,
+    profile: &Profile,
+    profile_key: ProfileKey,
+    new_contact_timer: u32,
+    new_contact_timer_version: u32,
+) -> Contact {
+    let profile_name = profile_display_name(profile);
+    if let Some(mut existing) = existing {
+        let previous_profile_name = previous_profile.map(profile_display_name);
+        let existing_name_is_profile_owned = existing.phone_number.is_none()
+            && previous_profile_name
+                .as_ref()
+                .is_some_and(|name| !name.is_empty() && name == &existing.name);
+        if existing.name.is_empty() || existing_name_is_profile_owned {
+            existing.name = profile_name;
+        }
+        existing.profile_key = profile_key.bytes.to_vec();
+        existing
+    } else {
+        Contact {
+            uuid,
+            phone_number: None,
+            name: profile_name,
+            profile_key: profile_key.bytes.to_vec(),
+            expire_timer: new_contact_timer,
+            expire_timer_version: new_contact_timer_version,
+            inbox_position: 0,
+            avatar: None,
+            verified: Verified::default(),
+        }
+    }
+}
+
+async fn run_contact_profile_worker<S: Store>(
+    mut store: S,
+    mut identified_websocket: SignalWebSocket<websocket::Identified>,
+    contact_updates: ContactUpdateCoordinator,
+    sender_uuid: Uuid,
+) {
+    while let Some(queued) = contact_updates.take_profile_update(sender_uuid).await {
+        let observation_timestamp = queued.update.observation_timestamp;
+        if let Err(error) = process_contact_profile_update(
+            &mut store,
+            &mut identified_websocket,
+            &contact_updates,
+            sender_uuid,
+            queued,
+        )
+        .await
+        {
+            error!(
+                %error,
+                %sender_uuid,
+                observation_timestamp,
+                "failed to update contact profile"
+            );
+        }
+    }
+}
+
+async fn process_contact_profile_update<S: Store>(
+    store: &mut S,
+    identified_websocket: &mut SignalWebSocket<websocket::Identified>,
+    contact_updates: &ContactUpdateCoordinator,
+    sender_uuid: Uuid,
+    queued: QueuedContactProfileUpdate,
+) -> Result<(), Error<<S as Store>::Error>> {
+    let queued = {
+        let contact_lock = contact_updates.contact_lock(sender_uuid).await;
+        let _contact_guard = contact_lock.lock().await;
+        let Some(queued) = contact_updates
+            .coalesce_current_profile_update(sender_uuid, queued)
+            .await
+        else {
+            debug!(%sender_uuid, "ignoring superseded contact profile update");
+            return Ok(());
+        };
+        let update = &queued.update;
+        let sender = update.sender;
+        let profile_key = update.profile_key;
+        let existing = store.contact_by_id(&sender).await?;
+        let stored_profile_key = store.profile_key(&sender).await?;
+        if !needs_profile_contact_upsert(
+            existing.as_ref(),
+            stored_profile_key.as_ref(),
+            &profile_key,
+        ) {
+            return Ok(());
+        }
+
+        let previous_profile = match stored_profile_key {
+            Some(stored_profile_key) => store.profile(sender_uuid, stored_profile_key).await?,
+            None => None,
+        };
+        let profile_key_is_unchanged = stored_profile_key.as_ref() == Some(&profile_key);
+        let latest_contact = store.contact_by_id(&sender).await?;
+
+        if profile_key_is_unchanged {
+            if let Some(profile) = previous_profile.as_ref() {
+                let profile_name = profile_display_name(profile);
+                if latest_contact.as_ref().is_some_and(|contact| {
+                    contact.name.is_empty()
+                        && profile_name.is_empty()
+                        && contact.profile_key.as_slice() == profile_key.bytes.as_slice()
+                }) {
+                    return Ok(());
+                }
+
+                let Some(queued) = contact_updates
+                    .coalesce_current_profile_update(sender_uuid, queued.clone())
+                    .await
+                else {
+                    return Ok(());
+                };
+                let update = &queued.update;
+                let contact = merge_profile_contact(
+                    sender_uuid,
+                    latest_contact,
+                    previous_profile.as_ref(),
+                    profile,
+                    update.profile_key,
+                    update.expire_timer,
+                    update.expire_timer_version,
+                );
+                store.save_contact(&contact).await?;
+                return Ok(());
+            }
+
+            if let Some(mut contact) = latest_contact {
+                if !contact.name.is_empty() {
+                    if contact_updates
+                        .coalesce_current_profile_update(sender_uuid, queued.clone())
+                        .await
+                        .is_none()
+                    {
+                        return Ok(());
+                    }
+                    contact.profile_key = profile_key.bytes.to_vec();
+                    store.save_contact(&contact).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        queued
+    };
+
+    let sender = queued.update.sender;
+    let Some(aci) = sender.aci() else {
+        return Ok(());
+    };
+    let profile_key = queued.update.profile_key;
+    let encrypted_profile = match tokio::time::timeout(
+        CONTACT_PROFILE_FETCH_TIMEOUT,
+        identified_websocket.retrieve_profile_by_id(aci, Some(profile_key)),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            warn!(%sender_uuid, "timed out retrieving contact profile");
+            return Ok(());
+        }
+    };
+    let profile = ProfileCipher::new(profile_key).decrypt(encrypted_profile)?;
+
+    let contact_lock = contact_updates.contact_lock(sender_uuid).await;
+    let _contact_guard = contact_lock.lock().await;
+    let Some(queued) = contact_updates
+        .coalesce_current_profile_update(sender_uuid, queued)
+        .await
+    else {
+        debug!(%sender_uuid, "discarding superseded contact profile response");
+        return Ok(());
+    };
+    let update = &queued.update;
+    let stored_profile_key = store.profile_key(&update.sender).await?;
+    let previous_profile = match stored_profile_key {
+        Some(stored_profile_key) => store.profile(sender_uuid, stored_profile_key).await?,
+        None => None,
+    };
+    let Some(queued) = contact_updates
+        .coalesce_current_profile_update(sender_uuid, queued)
+        .await
+    else {
+        debug!(%sender_uuid, "discarding superseded contact profile response");
+        return Ok(());
+    };
+    let update = &queued.update;
+    store
+        .save_profile(sender_uuid, update.profile_key, profile.clone())
+        .await?;
+
+    let latest_contact = store.contact_by_id(&update.sender).await?;
+    let contact = merge_profile_contact(
+        sender_uuid,
+        latest_contact,
+        previous_profile.as_ref(),
+        &profile,
+        update.profile_key,
+        update.expire_timer,
+        update.expire_timer_version,
+    );
+
+    info!(%sender_uuid, "saved contact profile");
+    store.save_contact(&contact).await?;
     Ok(())
 }
 
@@ -2674,8 +3241,10 @@ async fn register_pre_keys<S: Store>(
 }
 
 #[cfg(test)]
-mod storage_group_tests {
+mod tests {
     use super::*;
+    use futures::io::Cursor;
+    use libsignal_service::attachment_cipher::encrypt_in_place;
     use libsignal_service::groups_v2::{Group as ServiceGroup, Member as ServiceMember, Role};
     use libsignal_service::proto::manifest_record::{identifier::Type, Identifier};
     use libsignal_service::proto::{
@@ -2685,6 +3254,458 @@ mod storage_group_tests {
 
     fn aci(value: u128) -> Aci {
         Aci::from(Uuid::from_u128(value))
+    }
+
+    fn signal_sender_ciphertext_size(plaintext_size: usize) -> usize {
+        let padded_size = std::cmp::max(
+            ATTACHMENT_MIN_PADDED_PLAINTEXT_SIZE as usize,
+            1.05f64
+                .powf((plaintext_size as f64).log(1.05).ceil())
+                .floor() as usize,
+        );
+        ATTACHMENT_IV_SIZE as usize
+            + (padded_size / ATTACHMENT_CIPHER_BLOCK_SIZE as usize + 1)
+                * ATTACHMENT_CIPHER_BLOCK_SIZE as usize
+            + ATTACHMENT_MAC_SIZE as usize
+    }
+
+    #[test]
+    fn attachment_ciphertext_limit_includes_signal_padding_and_encryption_overhead() {
+        assert_eq!(attachment_ciphertext_size_limit(0), 592);
+        assert_eq!(attachment_ciphertext_size_limit(1), 592);
+        assert_eq!(
+            attachment_ciphertext_size_limit(25 * 1024 * 1024),
+            27_525_184
+        );
+
+        for plaintext_size in [
+            0,
+            1,
+            540,
+            541,
+            542,
+            1024,
+            100 * 1024,
+            25 * 1024 * 1024,
+            u32::MAX as usize,
+        ] {
+            assert!(
+                signal_sender_ciphertext_size(plaintext_size)
+                    <= attachment_ciphertext_size_limit(plaintext_size),
+                "ciphertext bound was too small for {plaintext_size} plaintext bytes"
+            );
+        }
+
+        let mut exponent = 0;
+        loop {
+            let boundary = 1.05f64.powi(exponent);
+            if boundary > u32::MAX as f64 + 2.0 {
+                break;
+            }
+            let first_candidate = boundary.floor() as i64 - 2;
+            let last_candidate = boundary.ceil() as i64 + 2;
+            for plaintext_size in first_candidate..=last_candidate {
+                if !(0..=u32::MAX as i64).contains(&plaintext_size) {
+                    continue;
+                }
+                let plaintext_size = plaintext_size as usize;
+                assert!(
+                    signal_sender_ciphertext_size(plaintext_size)
+                        <= attachment_ciphertext_size_limit(plaintext_size),
+                    "ciphertext bound was too small at bucket edge {plaintext_size}"
+                );
+            }
+            exponent += 1;
+        }
+    }
+
+    #[test]
+    fn attachment_ciphertext_framing_rejects_lengths_that_cannot_be_decrypted() {
+        for ciphertext_size in [0, 31, 32, 47, 48, 63, 65, 79] {
+            assert!(!is_valid_attachment_ciphertext_size(ciphertext_size));
+        }
+        for ciphertext_size in [64, 80, 96, 592] {
+            assert!(is_valid_attachment_ciphertext_size(ciphertext_size));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_attachment_reader_stops_after_first_excess_byte() {
+        let max_ciphertext_size = 64;
+        let mut reader = Cursor::new(vec![7; max_ciphertext_size + 32]);
+
+        let ciphertext = read_attachment_ciphertext(&mut reader, 0, Some(max_ciphertext_size))
+            .await
+            .unwrap();
+
+        assert!(ciphertext.is_none());
+        assert_eq!(reader.position(), (max_ciphertext_size + 1) as u64);
+    }
+
+    #[tokio::test]
+    async fn bounded_attachment_reader_accepts_the_exact_limit() {
+        let expected = vec![7; 64];
+        let mut reader = Cursor::new(expected.clone());
+
+        let ciphertext = read_attachment_ciphertext(&mut reader, 0, Some(expected.len()))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ciphertext, expected);
+        assert_eq!(reader.position(), expected.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn bounded_attachment_reader_preserves_digest_and_decryption_input() {
+        let key = [9; 64];
+        let plaintext = b"bounded attachment";
+        let mut encrypted = plaintext.to_vec();
+        encrypted.resize(ATTACHMENT_MIN_PADDED_PLAINTEXT_SIZE as usize, 0);
+        encrypt_in_place([7; 16], key, &mut encrypted);
+        let expected_digest = sha2::Sha256::digest(&encrypted);
+        let ciphertext_limit = attachment_ciphertext_size_limit(plaintext.len());
+        let mut reader = Cursor::new(encrypted);
+
+        let mut downloaded = read_attachment_ciphertext(&mut reader, 0, Some(ciphertext_limit))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(sha2::Sha256::digest(&downloaded), expected_digest);
+        decrypt_in_place(key, &mut downloaded).unwrap();
+        downloaded.truncate(plaintext.len());
+        assert_eq!(downloaded, plaintext);
+    }
+
+    fn contact(name: &str, profile_key: Vec<u8>) -> Contact {
+        Contact {
+            uuid: Uuid::from_u128(1),
+            phone_number: None,
+            name: name.into(),
+            verified: Verified::default(),
+            profile_key,
+            expire_timer: 10,
+            expire_timer_version: 2,
+            inbox_position: 3,
+            avatar: None,
+        }
+    }
+
+    fn profile(name: Option<(&str, Option<&str>)>) -> Profile {
+        Profile {
+            name: name.map(|(given_name, family_name)| {
+                libsignal_service::profile_name::ProfileName {
+                    given_name: given_name.into(),
+                    family_name: family_name.map(Into::into),
+                }
+            }),
+            ..Profile::default()
+        }
+    }
+
+    fn contact_profile_update(
+        uuid: Uuid,
+        observation_timestamp: u64,
+        profile_key: ProfileKey,
+    ) -> ContactProfileUpdate {
+        ContactProfileUpdate {
+            sender: ServiceId::Aci(Aci::from(uuid)),
+            profile_key,
+            observation_timestamp,
+            expire_timer: 10,
+            expire_timer_version: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_update_order_uses_observation_sequence_not_content_timestamp() {
+        let coordinator = ContactUpdateCoordinator::default();
+        let uuid = Uuid::from_u128(1);
+        let first = contact_profile_update(uuid, u64::MAX, ProfileKey::create([7; 32]));
+        let later = contact_profile_update(uuid, 1, ProfileKey::create([8; 32]));
+
+        coordinator.enqueue_profile_update(uuid, first).await;
+        coordinator.enqueue_profile_update(uuid, later).await;
+        let queued = coordinator.take_profile_update(uuid).await.unwrap();
+
+        assert_eq!(queued.update.observation_timestamp, 1);
+        assert_eq!(queued.update.profile_key.bytes, [8; 32]);
+        assert_eq!(queued.observation.sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn same_key_profile_updates_coalesce_to_the_latest_payload() {
+        let coordinator = ContactUpdateCoordinator::default();
+        let uuid = Uuid::from_u128(1);
+        let profile_key = ProfileKey::create([7; 32]);
+        let first = contact_profile_update(uuid, 20, profile_key);
+        let mut latest = contact_profile_update(uuid, 21, profile_key);
+        latest.expire_timer = 30;
+        latest.expire_timer_version = 4;
+
+        coordinator.enqueue_profile_update(uuid, first).await;
+        let first_queued = coordinator.take_profile_update(uuid).await.unwrap();
+        coordinator.enqueue_profile_update(uuid, latest).await;
+        let coalesced = coordinator
+            .coalesce_current_profile_update(uuid, first_queued)
+            .await
+            .unwrap();
+
+        assert_eq!(coalesced.update.observation_timestamp, 21);
+        assert_eq!(coalesced.update.expire_timer, 30);
+        assert_eq!(coalesced.update.expire_timer_version, 4);
+        assert_eq!(coalesced.observation.sequence, 2);
+        assert!(coordinator.take_profile_update(uuid).await.is_none());
+    }
+
+    #[test]
+    fn queue_empty_waits_for_profile_workers_and_restart_has_no_active_flag() {
+        let workers = ContactProfileWorkerQueue::default();
+        assert!(workers.is_empty());
+
+        workers
+            .workers
+            .push(future::pending::<Uuid>().boxed_local());
+        assert!(!workers.is_empty());
+
+        drop(workers);
+        assert!(ContactProfileWorkerQueue::default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn contact_updates_share_a_lock_and_supersede_inflight_profiles() {
+        let coordinator = ContactUpdateCoordinator::default();
+        let uuid = Uuid::from_u128(1);
+        let old = contact_profile_update(uuid, 20, ProfileKey::create([7; 32]));
+        let new = contact_profile_update(uuid, 21, ProfileKey::create([8; 32]));
+        coordinator.enqueue_profile_update(uuid, old).await;
+        let old_queued = coordinator.take_profile_update(uuid).await.unwrap();
+        let old_lock = coordinator.contact_lock(uuid).await;
+        let new_lock = coordinator.contact_lock(uuid).await;
+        let old_guard = old_lock.lock().await;
+
+        assert!(Arc::ptr_eq(&old_lock, &new_lock));
+        assert!(new_lock.try_lock().is_err());
+        let mut enqueue_new = Box::pin(coordinator.enqueue_profile_update(uuid, new));
+        assert!(matches!(
+            futures::poll!(enqueue_new.as_mut()),
+            std::task::Poll::Pending
+        ));
+
+        drop(old_guard);
+        enqueue_new.await;
+        assert!(coordinator
+            .coalesce_current_profile_update(uuid, old_queued)
+            .await
+            .is_none());
+        let new_queued = coordinator.take_profile_update(uuid).await.unwrap();
+        assert_eq!(new_queued.update.profile_key.bytes, [8; 32]);
+        assert!(new_lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn empty_sync_uses_cached_profile_name_and_canonical_key() {
+        let profile_key = ProfileKey::create([7; 32]);
+        let cached_profile = profile(Some(("Profile", Some("Name"))));
+        let phone_number = "+12025550123".parse::<PhoneNumber>().unwrap();
+        let mut synchronized = contact("", Vec::new());
+        synchronized.phone_number = Some(phone_number.clone());
+        synchronized.expire_timer = 20;
+        synchronized.expire_timer_version = 4;
+        synchronized.inbox_position = 9;
+        let mut existing = contact("Legacy Profile", profile_key.bytes.to_vec());
+        existing.verified = Verified {
+            identity_key: Some(vec![5; 33]),
+            ..Verified::default()
+        };
+        let expected_verified = existing.verified.clone();
+
+        let merged = merge_synchronized_contact(
+            synchronized,
+            Some(existing),
+            Some(profile_key),
+            Some(&cached_profile),
+        );
+
+        assert_eq!(merged.name, "Profile Name");
+        assert_eq!(merged.profile_key, profile_key.bytes);
+        assert_eq!(merged.phone_number, Some(phone_number));
+        assert_eq!(merged.expire_timer, 20);
+        assert_eq!(merged.expire_timer_version, 4);
+        assert_eq!(merged.inbox_position, 9);
+        assert_eq!(merged.verified, expected_verified);
+    }
+
+    #[test]
+    fn nonempty_synchronized_name_wins_over_profile() {
+        let profile_key = ProfileKey::create([7; 32]);
+        let cached_profile = profile(Some(("Profile", None)));
+        let synchronized = contact("Address Book", Vec::new());
+
+        let merged = merge_synchronized_contact(
+            synchronized,
+            Some(contact("Old Profile", profile_key.bytes.to_vec())),
+            Some(profile_key),
+            Some(&cached_profile),
+        );
+
+        assert_eq!(merged.name, "Address Book");
+        assert_eq!(merged.profile_key, profile_key.bytes);
+    }
+
+    #[test]
+    fn legacy_empty_sync_keeps_a_profile_fallback_without_a_cached_profile() {
+        let profile_key = ProfileKey::create([7; 32]);
+
+        let merged = merge_synchronized_contact(
+            contact("", Vec::new()),
+            Some(contact("Legacy Profile", profile_key.bytes.to_vec())),
+            Some(profile_key),
+            None,
+        );
+
+        assert_eq!(merged.name, "Legacy Profile");
+        assert_eq!(merged.profile_key, profile_key.bytes);
+    }
+
+    #[test]
+    fn synchronized_contact_prefers_canonical_key_and_drops_a_malformed_orphan() {
+        let profile_key = ProfileKey::create([7; 32]);
+        let canonical = merge_synchronized_contact(
+            contact("Synced", Vec::new()),
+            Some(contact("Existing", vec![8; 32])),
+            Some(profile_key),
+            None,
+        );
+        let malformed_orphan = merge_synchronized_contact(
+            contact("Synced", Vec::new()),
+            Some(contact("Existing", vec![8; 31])),
+            None,
+            None,
+        );
+
+        assert_eq!(canonical.profile_key, profile_key.bytes);
+        assert!(malformed_orphan.profile_key.is_empty());
+    }
+
+    #[test]
+    fn profile_refresh_updates_a_known_profile_name() {
+        let old_profile = profile(Some(("Old", Some("Profile"))));
+        let new_profile = profile(Some(("New", Some("Profile"))));
+        let new_profile_key = ProfileKey::create([8; 32]);
+
+        let merged = merge_profile_contact(
+            Uuid::from_u128(1),
+            Some(contact("Old Profile", vec![7; 32])),
+            Some(&old_profile),
+            &new_profile,
+            new_profile_key,
+            30,
+            4,
+        );
+
+        assert_eq!(merged.name, "New Profile");
+        assert_eq!(merged.profile_key, new_profile_key.bytes);
+        assert_eq!(merged.expire_timer, 10);
+        assert_eq!(merged.expire_timer_version, 2);
+    }
+
+    #[test]
+    fn profile_refresh_preserves_synchronized_contact_fields() {
+        let old_profile = profile(Some(("Address", Some("Book"))));
+        let new_profile = profile(Some(("New", Some("Profile"))));
+        let new_profile_key = ProfileKey::create([8; 32]);
+        let phone_number = "+12025550123".parse::<PhoneNumber>().unwrap();
+        let mut existing = contact("Address Book", vec![7; 32]);
+        existing.phone_number = Some(phone_number.clone());
+        existing.expire_timer = 60;
+        existing.expire_timer_version = 6;
+        existing.inbox_position = 12;
+        existing.avatar = Some(libsignal_service::models::Attachment {
+            content_type: "image/png".into(),
+            reader: bytes::Bytes::from_static(b"avatar"),
+        });
+        existing.verified = Verified {
+            identity_key: Some(vec![6; 33]),
+            ..Verified::default()
+        };
+        let expected_verified = existing.verified.clone();
+
+        let merged = merge_profile_contact(
+            Uuid::from_u128(1),
+            Some(existing),
+            Some(&old_profile),
+            &new_profile,
+            new_profile_key,
+            30,
+            4,
+        );
+
+        assert_eq!(merged.name, "Address Book");
+        assert_eq!(merged.phone_number, Some(phone_number));
+        assert_eq!(merged.profile_key, new_profile_key.bytes);
+        assert_eq!(merged.expire_timer, 60);
+        assert_eq!(merged.expire_timer_version, 6);
+        assert_eq!(merged.inbox_position, 12);
+        assert_eq!(merged.verified, expected_verified);
+        let avatar = merged.avatar.unwrap();
+        assert_eq!(avatar.content_type, "image/png");
+        assert_eq!(avatar.reader, bytes::Bytes::from_static(b"avatar"));
+    }
+
+    #[test]
+    fn profile_contact_upsert_detects_empty_names_and_key_drift() {
+        let profile_key = ProfileKey::create([7; 32]);
+        let other_profile_key = ProfileKey::create([8; 32]);
+        let complete = contact("Profile", profile_key.bytes.to_vec());
+        let empty = contact("", profile_key.bytes.to_vec());
+        let stale_duplicate = contact("Profile", other_profile_key.bytes.to_vec());
+
+        assert!(needs_profile_contact_upsert(
+            None,
+            Some(&profile_key),
+            &profile_key
+        ));
+        assert!(needs_profile_contact_upsert(
+            Some(&empty),
+            Some(&profile_key),
+            &profile_key
+        ));
+        assert!(needs_profile_contact_upsert(
+            Some(&stale_duplicate),
+            Some(&profile_key),
+            &profile_key
+        ));
+        assert!(needs_profile_contact_upsert(
+            Some(&complete),
+            None,
+            &profile_key
+        ));
+        assert!(needs_profile_contact_upsert(
+            Some(&complete),
+            Some(&other_profile_key),
+            &profile_key
+        ));
+        assert!(!needs_profile_contact_upsert(
+            Some(&complete),
+            Some(&profile_key),
+            &profile_key
+        ));
+    }
+
+    #[test]
+    fn profile_contact_creation_uses_profile_name_and_message_timer() {
+        let profile = profile(Some(("New", Some("Contact"))));
+        let profile_key = ProfileKey::create([7; 32]);
+
+        let merged =
+            merge_profile_contact(Uuid::from_u128(1), None, None, &profile, profile_key, 30, 4);
+
+        assert_eq!(merged.name, "New Contact");
+        assert_eq!(merged.profile_key, profile_key.bytes);
+        assert_eq!(merged.expire_timer, 30);
+        assert_eq!(merged.expire_timer_version, 4);
     }
 
     fn service_group(members: &[Aci]) -> ServiceGroup {
