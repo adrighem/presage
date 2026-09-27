@@ -9,14 +9,18 @@ use presage::{
 use protocol::{IdentityType, SqliteProtocolStore};
 use sqlx::{
     SqlitePool, query, query_scalar,
-    sqlite::{SqliteJournalMode, SqliteSynchronous},
+    sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 
+mod client_identity;
+mod client_outbox;
 mod content;
 mod data;
 mod error;
 mod protocol;
 
+pub use client_identity::IdentityChangeNotice;
+pub use client_outbox::{ClientOutboxKind, ClientOutboxMessage};
 pub use error::SqliteStoreError;
 pub use presage::model::identity::OnNewIdentity;
 pub use sqlx::sqlite::SqliteConnectOptions;
@@ -62,7 +66,14 @@ impl SqliteStore {
         let options = options
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full);
-        let db = SqlitePool::connect_with(options).await?;
+        // Signal protocol state uses read-modify-write transactions. Multiple
+        // SQLite connections can race those transactions and return
+        // SQLITE_BUSY even with WAL and a busy timeout, so serialize access at
+        // the pool boundary.
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
 
         sqlx::migrate!().run(&db).await?;
         Ok(Self {
@@ -276,5 +287,88 @@ impl StateStore for SqliteStore {
                 .await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+
+    struct TestDatabase(PathBuf);
+
+    impl TestDatabase {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("presage-store-pool-{}.db3", rand::random::<u64>())),
+            )
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(format!("{}-shm", self.0.display()));
+            let _ = std::fs::remove_file(format!("{}-wal", self.0.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_serializes_pool_access() {
+        let store = SqliteStore::open("sqlite::memory:", OnNewIdentity::TrustUnverified)
+            .await
+            .unwrap();
+
+        assert_eq!(store.db.options().get_max_connections(), 1);
+        store.db.close().await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_queues_a_writer_behind_an_active_transaction() {
+        let database = TestDatabase::new();
+        let options = SqliteConnectOptions::new()
+            .filename(database.path())
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_millis(20));
+        let store = SqliteStore::open_with_options(options, OnNewIdentity::TrustUnverified)
+            .await
+            .unwrap();
+        if store.db.options().get_max_connections() > 1 {
+            let first_connection = store.db.acquire().await.unwrap();
+            let second_connection = store.db.acquire().await.unwrap();
+            drop(first_connection);
+            drop(second_connection);
+            assert!(store.db.size() >= 2);
+        }
+        let mut transaction = store.db.begin().await.unwrap();
+        query("INSERT OR REPLACE INTO kv (key, value) VALUES ('writer-a', X'01')")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        let mut second_write = Box::pin(
+            query("INSERT OR REPLACE INTO kv (key, value) VALUES ('writer-b', X'02')")
+                .execute(&store.db),
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second_write)
+                .await
+                .is_err()
+        );
+        transaction.commit().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), second_write)
+            .await
+            .unwrap()
+            .unwrap();
+        store.db.close().await;
     }
 }

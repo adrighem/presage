@@ -9,9 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Merged the signal-purple fork branch (`fix/signal-purple-boundaries`) into `main`: group synchronization
+  from Storage Service, encrypted client outbox, client message projection, verified-identity replacement
+  gating (`OnNewIdentity::TrustUnverified`), group reconcile/leave support, and attachment + contact profile
+  hardening. These commits were previously only reachable through a pinned git rev; they are now normal
+  history on `main`.
+
 ### Fixed
 
+- Serialize SQLite store pool access (`max_connections(1)`), so concurrent writers no longer race
+  read-modify-write protocol-state transactions into `SQLITE_BUSY`.
+
 ### Changed
+
+- The fork work above was reconciled onto the libsignal 0.99.0 / sqlx 0.9 upgrade: `Metadata::timestamp`
+  became `client_timestamp` (plus the new `pni_verified` field), `SyncMessage` payloads moved into the
+  `SyncContent` oneof, and `PushService::get_attachment` now returns an `AttachmentDownload`.
 
 ## [0.6.1]
 

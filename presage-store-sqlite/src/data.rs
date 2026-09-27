@@ -35,7 +35,7 @@ pub struct SqlContact {
     pub inbox_position: i64,
     pub avatar: Option<Vec<u8>>,
 
-    pub destination_aci: Option<String>,
+    pub destination_aci: Option<Uuid>,
     pub identity_key: Option<Vec<u8>>,
     pub is_verified: Option<bool>,
 }
@@ -55,10 +55,12 @@ impl TryInto<Contact> for SqlContact {
             verified: Verified {
                 destination_aci_binary: self
                     .destination_aci
-                    .as_deref()
-                    .and_then(Aci::parse_from_service_id_string)
+                    .map(Aci::from)
                     .map(|aci| aci.service_id_binary()),
-                destination_aci: self.destination_aci,
+                destination_aci: self
+                    .destination_aci
+                    .map(Aci::from)
+                    .map(|aci| aci.service_id_string()),
                 identity_key: self.identity_key,
                 state: self.is_verified.map(|v| {
                     match v {

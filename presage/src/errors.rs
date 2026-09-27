@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use libsignal_service::prelude::MessageSenderError;
 use libsignal_service::protocol::UsernameError;
 use libsignal_service::websocket::registration::RegistrationSessionMetadataResponse;
+use libsignal_service::StorageServiceError;
 use libsignal_service::{models::ParseContactError, protocol::SignalProtocolError};
 
 use crate::store::{StoreError, ThreadError};
@@ -31,6 +32,8 @@ pub enum Error<S: std::error::Error> {
     ProtocolError(#[from] SignalProtocolError),
     #[error("libsignal-service error: {0}")]
     ServiceError(#[from] libsignal_service::prelude::ServiceError),
+    #[error("Signal storage service error: {0}")]
+    StorageServiceError(#[from] StorageServiceError),
     #[error("libsignal-service error: {0}")]
     ProfileManagerError(#[from] libsignal_service::ProfileManagerError),
     #[error("libsignal-service sending error: {0}")]
@@ -59,6 +62,14 @@ pub enum Error<S: std::error::Error> {
     AttachmentCipherError(#[from] libsignal_service::attachment_cipher::AttachmentCipherError),
     #[error("unknown group")]
     UnknownGroup,
+    #[error("Signal Storage Service returned an incomplete group snapshot")]
+    IncompleteStorageGroupSnapshot,
+    #[error("Signal Storage Service returned an invalid group record")]
+    InvalidStorageGroupRecord,
+    #[error("the Signal group revision changed too many times; retry the operation")]
+    GroupRevisionConflict,
+    #[error("Signal returned an invalid group leave change")]
+    InvalidGroupLeaveChange,
     #[error("unknown recipient")]
     UnknownRecipient,
     #[error("timeout: {0}")]
@@ -71,6 +82,10 @@ pub enum Error<S: std::error::Error> {
     RequestingCodeForbidden(RegistrationSessionMetadataResponse),
     #[error("attachment sha256 checksum did not match")]
     UnexpectedAttachmentChecksum,
+    #[error("attachment ciphertext has invalid framing")]
+    InvalidAttachmentCiphertext,
+    #[error("attachment exceeds the configured plaintext size limit of {max_size} bytes")]
+    AttachmentSizeLimitExceeded { max_size: usize },
     #[error("Unverified registration session (i.e. wrong verification code)")]
     UnverifiedRegistrationSession,
     #[error("profile cipher error")]

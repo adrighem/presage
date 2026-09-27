@@ -1,36 +1,48 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
-use futures::{future, AsyncReadExt, Stream, StreamExt};
+use futures::future::LocalBoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{future, AsyncReadExt, FutureExt, Stream, StreamExt};
 use libsignal_service::prelude::SessionStoreExt;
 use libsignal_service::protocol::{ProtocolAddress, SessionStore};
 use libsignal_service::provisioning::ProvisioningSecrets;
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
     cipher,
-    configuration::{ServiceConfiguration, SignalServers},
+    configuration::{Endpoint, ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
-    groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
+    groups_v2::{
+        decrypt_group, GroupChange, GroupDecodingError, GroupOperations, GroupsManager,
+        InMemoryCredentialsCache,
+    },
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
-    prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
+    prelude::{
+        phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage,
+        StorageServiceKey, Uuid,
+    },
     profile_cipher::ProfileCipher,
     proto::{
         data_message::Delete,
+        group_change,
+        manifest_record::identifier,
+        storage_record,
         sync_message::{
             self, sticker_pack_operation, Content as SyncContent, StickerPackOperation,
         },
-        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage, SyncMessage,
-        Verified,
+        AttachmentPointer, DataMessage, EditMessage, GroupChangeResponse, GroupContextV2,
+        GroupResponse, NullMessage, StorageRecord, SyncMessage, Verified,
     },
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
-    push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
+    push_service::{HttpAuthOverride, PushService, ServiceError, ServiceIds, DEFAULT_DEVICE_ID},
     receiver::MessageReceiver,
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
@@ -44,13 +56,15 @@ use libsignal_service::{
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::ProfileKey,
+        GroupMasterKeyBytes,
     },
-    AccountManager, Profile, ServiceIdExt,
+    AccountManager, Profile, ServiceIdExt, StorageService,
 };
 use libsignal_service::{
     libsignal_account_keys::AccountEntropyPool, proto::addressable_message::Author,
 };
 use rand::rng;
+use reqwest::{header::HeaderMap, header::CONTENT_TYPE, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::sync::Mutex;
@@ -59,18 +73,387 @@ use url::Url;
 
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
-use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
+use crate::store::{
+    ContentExt, ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread,
+};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
 pub use crate::model::messages::Received;
 
 type ServiceCipher<S> = cipher::ServiceCipher<S>;
 type MessageSender<S> = libsignal_service::prelude::MessageSender<S>;
+const GROUP_LEAVE_REVISION_ATTEMPTS: usize = 3;
+const GROUPS_V2_ENDPOINT: &str = "/v2/groups/";
+const SIGNAL_TIMESTAMP_HEADER: &str = "x-signal-timestamp";
+const ATTACHMENT_MIN_PADDED_PLAINTEXT_SIZE: u128 = 541;
+const ATTACHMENT_PRIVACY_PADDING_DENOMINATOR: u128 = 20;
+const ATTACHMENT_CIPHER_BLOCK_SIZE: u128 = 16;
+const ATTACHMENT_IV_SIZE: u128 = 16;
+const ATTACHMENT_MAC_SIZE: u128 = 32;
+const ATTACHMENT_MIN_CIPHERTEXT_SIZE: usize = 64;
+const CONTACT_PROFILE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProfileUpdateObservation {
+    sequence: u64,
+    profile_key: [u8; 32],
+}
+
+#[derive(Clone)]
+struct ContactProfileUpdate {
+    sender: ServiceId,
+    profile_key: ProfileKey,
+    observation_timestamp: u64,
+    expire_timer: u32,
+    expire_timer_version: u32,
+}
+
+#[derive(Clone)]
+struct QueuedContactProfileUpdate {
+    update: ContactProfileUpdate,
+    observation: ProfileUpdateObservation,
+}
+
+#[derive(Default)]
+struct ContactUpdateCoordinatorState {
+    locks: HashMap<Uuid, Arc<Mutex<()>>>,
+    latest_profile_updates: HashMap<Uuid, ProfileUpdateObservation>,
+    pending_profile_updates: HashMap<Uuid, QueuedContactProfileUpdate>,
+    next_profile_update_sequence: u64,
+}
+
+#[derive(Clone, Default)]
+struct ContactUpdateCoordinator {
+    inner: Arc<Mutex<ContactUpdateCoordinatorState>>,
+}
+
+impl ContactUpdateCoordinator {
+    async fn contact_lock(&self, uuid: Uuid) -> Arc<Mutex<()>> {
+        let mut state = self.inner.lock().await;
+        state.locks.entry(uuid).or_default().clone()
+    }
+
+    async fn enqueue_profile_update(&self, uuid: Uuid, update: ContactProfileUpdate) {
+        let contact_lock = self.contact_lock(uuid).await;
+        let _contact_guard = contact_lock.lock().await;
+        let mut state = self.inner.lock().await;
+        state.next_profile_update_sequence = state
+            .next_profile_update_sequence
+            .checked_add(1)
+            .expect("contact profile update sequence was exhausted");
+        let observation = ProfileUpdateObservation {
+            sequence: state.next_profile_update_sequence,
+            profile_key: update.profile_key.bytes,
+        };
+        state.latest_profile_updates.insert(uuid, observation);
+        state.pending_profile_updates.insert(
+            uuid,
+            QueuedContactProfileUpdate {
+                update,
+                observation,
+            },
+        );
+    }
+
+    async fn take_profile_update(&self, uuid: Uuid) -> Option<QueuedContactProfileUpdate> {
+        self.inner
+            .lock()
+            .await
+            .pending_profile_updates
+            .remove(&uuid)
+    }
+
+    async fn has_pending_profile_update(&self, uuid: Uuid) -> bool {
+        self.inner
+            .lock()
+            .await
+            .pending_profile_updates
+            .contains_key(&uuid)
+    }
+
+    async fn coalesce_current_profile_update(
+        &self,
+        uuid: Uuid,
+        queued: QueuedContactProfileUpdate,
+    ) -> Option<QueuedContactProfileUpdate> {
+        let mut state = self.inner.lock().await;
+        let current = *state.latest_profile_updates.get(&uuid)?;
+        if current.profile_key != queued.update.profile_key.bytes {
+            return None;
+        }
+        if state
+            .pending_profile_updates
+            .get(&uuid)
+            .is_some_and(|pending| pending.observation == current)
+        {
+            return state.pending_profile_updates.remove(&uuid);
+        }
+        (current == queued.observation).then_some(queued)
+    }
+}
+
+#[derive(Default)]
+struct ContactProfileWorkerQueue {
+    workers: FuturesUnordered<LocalBoxFuture<'static, Uuid>>,
+    active: HashSet<Uuid>,
+}
+
+impl ContactProfileWorkerQueue {
+    fn is_empty(&self) -> bool {
+        self.workers.is_empty()
+    }
+
+    fn start<S: Store>(
+        &mut self,
+        store: S,
+        identified_websocket: SignalWebSocket<websocket::Identified>,
+        contact_updates: ContactUpdateCoordinator,
+        sender_uuid: Uuid,
+    ) {
+        if self.active.insert(sender_uuid) {
+            self.workers.push(
+                run_contact_profile_worker(
+                    store,
+                    identified_websocket,
+                    contact_updates,
+                    sender_uuid,
+                )
+                .map(move |_| sender_uuid)
+                .boxed_local(),
+            );
+        }
+    }
+
+    fn complete(&mut self, sender_uuid: Uuid) {
+        self.active.remove(&sender_uuid);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageGroupSnapshotError {
+    DuplicateManifestKey,
+    ResponseKeySetMismatch,
+}
+
+fn storage_group_item_keys(
+    manifest: &libsignal_service::proto::ManifestRecord,
+) -> Result<Vec<Vec<u8>>, StorageGroupSnapshotError> {
+    let keys = manifest
+        .identifiers
+        .iter()
+        .filter(|identifier| identifier.r#type == identifier::Type::Groupv2 as i32)
+        .map(|identifier| identifier.raw.clone())
+        .collect::<Vec<_>>();
+    let unique = keys.iter().collect::<HashSet<_>>();
+    if unique.len() != keys.len() {
+        return Err(StorageGroupSnapshotError::DuplicateManifestKey);
+    }
+    Ok(keys)
+}
+
+fn match_storage_group_records(
+    requested: &[Vec<u8>],
+    returned: Vec<(Vec<u8>, StorageRecord)>,
+) -> Result<Vec<StorageRecord>, StorageGroupSnapshotError> {
+    let requested_keys = requested.iter().cloned().collect::<HashSet<_>>();
+    if requested_keys.len() != requested.len() {
+        return Err(StorageGroupSnapshotError::DuplicateManifestKey);
+    }
+
+    let mut records = HashMap::with_capacity(returned.len());
+    for (key, record) in returned {
+        if !requested_keys.contains(&key) || records.insert(key, record).is_some() {
+            return Err(StorageGroupSnapshotError::ResponseKeySetMismatch);
+        }
+    }
+    if records.len() != requested.len() {
+        return Err(StorageGroupSnapshotError::ResponseKeySetMismatch);
+    }
+
+    requested
+        .iter()
+        .map(|key| {
+            records
+                .remove(key)
+                .ok_or(StorageGroupSnapshotError::ResponseKeySetMismatch)
+        })
+        .collect()
+}
+
+fn group_has_member(group: &libsignal_service::groups_v2::Group, aci: Aci) -> bool {
+    group.members.iter().any(|member| member.aci == aci)
+}
+
+fn stale_group_keys(
+    stored: impl IntoIterator<Item = GroupMasterKeyBytes>,
+    active: &HashSet<GroupMasterKeyBytes>,
+) -> Vec<GroupMasterKeyBytes> {
+    stored
+        .into_iter()
+        .filter(|key| !active.contains(key))
+        .collect()
+}
+
+fn group_candidate_keys(
+    manifest: impl IntoIterator<Item = GroupMasterKeyBytes>,
+    cached: impl IntoIterator<Item = GroupMasterKeyBytes>,
+) -> HashSet<GroupMasterKeyBytes> {
+    manifest.into_iter().chain(cached).collect()
+}
+
+fn active_group_from_snapshot(
+    master_key: GroupMasterKeyBytes,
+    group: libsignal_service::groups_v2::Group,
+    own_aci: Aci,
+) -> Option<(GroupMasterKeyBytes, Group)> {
+    group_has_member(&group, own_aci).then(|| (master_key, Group::from(group)))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupLeaveConfirmationError {
+    StillMember,
+}
+
+fn confirmed_group_after_leave(
+    group: Option<libsignal_service::groups_v2::Group>,
+    own_aci: Aci,
+) -> Result<Option<Group>, GroupLeaveConfirmationError> {
+    match group {
+        Some(group) if group_has_member(&group, own_aci) => {
+            Err(GroupLeaveConfirmationError::StillMember)
+        }
+        Some(group) => Ok(Some(Group::from(group))),
+        None => Ok(None),
+    }
+}
+
+fn build_leave_group_actions(
+    operations: &GroupOperations,
+    own_aci: Aci,
+    version: u32,
+) -> Result<group_change::Actions, GroupDecodingError> {
+    let own_uuid: Uuid = own_aci.into();
+    Ok(group_change::Actions {
+        // Requests carry the raw ACI. The group service replaces this with the
+        // encrypted service ID in the signed response.
+        source_user_id: own_uuid.as_bytes().to_vec(),
+        version,
+        delete_members: vec![operations.build_remove_member_action(own_aci)?],
+        ..Default::default()
+    })
+}
+
+fn signal_response_timestamp(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(SIGNAL_TIMESTAMP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthoritativeGroupResponse {
+    Current,
+    Inactive,
+    Error,
+}
+
+fn classify_authoritative_group_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Result<AuthoritativeGroupResponse, ServiceError> {
+    if signal_response_timestamp(headers).is_none() {
+        return Err(ServiceError::InvalidFrame {
+            reason: "groups v2 response had no valid timestamp",
+        });
+    }
+    if matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
+        Ok(AuthoritativeGroupResponse::Inactive)
+    } else if status.is_success() {
+        Ok(AuthoritativeGroupResponse::Current)
+    } else {
+        Ok(AuthoritativeGroupResponse::Error)
+    }
+}
+
+fn group_from_response(
+    response: GroupResponse,
+) -> Result<libsignal_service::proto::Group, ServiceError> {
+    response.group.ok_or(ServiceError::GroupsV2Error)
+}
+
+async fn groups_v2_response_error(response: reqwest::Response) -> ServiceError {
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED {
+        return ServiceError::Unauthorized;
+    }
+    let body = response.text().await.unwrap_or_default();
+    let body = body.chars().take(1024).collect();
+    ServiceError::UnhandledResponseCode { status, body }
+}
+
+async fn fetch_authoritative_group(
+    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    push_service: &PushService,
+    master_key: &GroupMasterKeyBytes,
+) -> Result<Option<libsignal_service::proto::Group>, ServiceError> {
+    let secret_params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key));
+    let authorization = groups_manager
+        .get_authorization_for_today(&mut rand::rng(), secret_params)
+        .await?;
+    let response = push_service
+        .request(
+            Method::GET,
+            Endpoint::storage(GROUPS_V2_ENDPOINT),
+            HttpAuthOverride::Identified(authorization),
+        )?
+        .send()
+        .await
+        .map_err(ServiceError::from)?;
+
+    match classify_authoritative_group_response(response.status(), response.headers())? {
+        AuthoritativeGroupResponse::Inactive => return Ok(None),
+        AuthoritativeGroupResponse::Error => {
+            return Err(groups_v2_response_error(response).await);
+        }
+        AuthoritativeGroupResponse::Current => {}
+    }
+
+    let response = GroupResponse::decode(response.bytes().await?)?;
+    group_from_response(response).map(Some)
+}
+
+fn is_expected_leave_change(
+    change: &libsignal_service::groups_v2::GroupChanges,
+    expected_group_id: [u8; 32],
+    own_aci: Aci,
+    version: u32,
+) -> bool {
+    change.group_id == expected_group_id
+        && change.editor == own_aci
+        && change.version == version
+        && change
+            .changes
+            .iter()
+            .any(|item| matches!(item, GroupChange::DeleteMember(aci) if *aci == own_aci))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistrationType {
     Primary,
     Secondary,
+}
+
+/// Result details for a group leave accepted by the Signal group service.
+///
+/// Any returned value means membership was irreversibly removed on the server.
+/// The flags expose best-effort cleanup which callers may report as a nonfatal
+/// warning without restoring a group the account has already left. A peer
+/// notification is considered sent when no new leave change was required.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct LeaveGroupOutcome {
+    pub peer_notification_sent: bool,
+    pub local_group_removed: bool,
 }
 
 /// Manager state when the client is registered and can send and receive messages from Signal
@@ -81,6 +464,7 @@ pub struct Registered {
     pub(crate) identified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Identified>>>>,
     pub(crate) unidentified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Unidentified>>>>,
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
+    contact_updates: ContactUpdateCoordinator,
 
     pub(crate) data: Arc<RegistrationData>,
 }
@@ -99,6 +483,7 @@ impl Registered {
             identified_websocket: Default::default(),
             unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
+            contact_updates: Default::default(),
             data: Arc::new(data),
         }
     }
@@ -337,6 +722,24 @@ impl<S: Store> Manager<S, Registered> {
             .expect("logic error"))
     }
 
+    /// Master key of this account, either as stored, or derived from the account entropy pool.
+    ///
+    /// Since libsignal 0.99 the master key is no longer carried by the keys sync message, so the
+    /// account entropy pool is the only remaining derivation path for linked devices.
+    async fn master_key(&self) -> Result<Option<MasterKey>, Error<S::Error>> {
+        let from_store = self.store().fetch_master_key().await?;
+
+        if let Some(key) = from_store {
+            Ok(Some(key))
+        } else {
+            let aep = self.account_entropy_pool().await?;
+            Ok(aep.map(|aep| {
+                MasterKey::from_slice(aep.derive_svr_key().as_slice())
+                    .expect("Derived SVR key from account entropy pool to be a valid master key")
+            }))
+        }
+    }
+
     async fn account_entropy_pool(&self) -> Result<Option<AccountEntropyPool>, Error<S::Error>> {
         let from_store = self.store().fetch_account_entropy_pool().await?;
 
@@ -567,6 +970,316 @@ impl<S: Store> Manager<S, Registered> {
         Ok(groups_manager)
     }
 
+    /// Fetches the account's current group records from Signal Storage Service
+    /// and refreshes their encrypted group metadata in the local store.
+    ///
+    /// Linked devices do not receive an authoritative legacy group snapshot.
+    /// Storage Service is therefore required to discover existing groups that
+    /// have not produced a message since this device was linked.
+    pub async fn synchronize_storage_groups(&mut self) -> Result<usize, Error<S::Error>> {
+        let master_key = self
+            .master_key()
+            .await?
+            .ok_or(Error::MissingKeyError("master key".into()))?;
+        let storage_key = StorageServiceKey::from_master_key(&master_key);
+        let storage = StorageService::new(self.identified_push_service(), storage_key).await?;
+        let manifest = storage.manifest().await?;
+        let group_item_keys =
+            storage_group_item_keys(&manifest).map_err(|_| Error::InvalidStorageGroupRecord)?;
+        let record_ikm =
+            (!manifest.record_ikm.is_empty()).then_some(manifest.record_ikm.as_slice());
+        let returned = storage
+            .read_items_with_keys(group_item_keys.clone(), record_ikm)
+            .await?;
+        let records = match_storage_group_records(&group_item_keys, returned)
+            .map_err(|_| Error::IncompleteStorageGroupSnapshot)?;
+
+        let mut manifest_group_keys = HashSet::new();
+
+        for record in records {
+            let Some(storage_record::Record::GroupV2(group_record)) = record.record else {
+                return Err(Error::InvalidStorageGroupRecord);
+            };
+            let master_key: GroupMasterKeyBytes = group_record
+                .master_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidStorageGroupRecord)?;
+            if !manifest_group_keys.insert(master_key) {
+                return Err(Error::InvalidStorageGroupRecord);
+            }
+        }
+
+        let stored_keys = self
+            .store()
+            .groups()
+            .await?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        let candidates = group_candidate_keys(
+            manifest_group_keys.iter().copied(),
+            stored_keys.iter().copied(),
+        );
+
+        let mut groups_manager = self.groups_manager().await?;
+        let push_service = self.identified_push_service();
+        let own_aci = self.registration_data().service_ids.aci();
+        let mut active_groups = Vec::new();
+
+        for master_key in candidates {
+            // Storage records do not carry a group revision. Always fetch the
+            // current group state for manifest and cached candidates so a
+            // manifest/group update race cannot drop an active group.
+            let Some(encrypted) =
+                fetch_authoritative_group(&mut groups_manager, &push_service, &master_key).await?
+            else {
+                // A timestamp-bearing GroupsV2 403 or 404 definitively means
+                // this group is inactive. Other failures abort the refresh.
+                continue;
+            };
+            let group = decrypt_group(&master_key, encrypted)?;
+            if let Some(active_group) = active_group_from_snapshot(master_key, group, own_aci) {
+                active_groups.push(active_group);
+            }
+        }
+
+        // All network reads and decryptions above must succeed before the first
+        // store mutation. A partial remote snapshot therefore never prunes a
+        // previously valid local group.
+        let active_keys = active_groups
+            .iter()
+            .map(|(key, _)| *key)
+            .collect::<HashSet<_>>();
+        let synchronized = active_keys.len();
+        let stale_keys = stale_group_keys(stored_keys, &active_keys);
+        self.store()
+            .reconcile_groups(active_groups, stale_keys)
+            .await?;
+
+        Ok(synchronized)
+    }
+
+    /// Leave a GroupsV2 group and notify its remaining members.
+    ///
+    /// The current group state is fetched immediately before the authenticated
+    /// mutation. Revision conflicts are refreshed and retried. A valid signed
+    /// change proves success directly. If that proof is unavailable, a second
+    /// authoritative read must confirm nonmembership before local state is
+    /// changed. Notification and local cleanup failures after confirmed success
+    /// are reflected in [`LeaveGroupOutcome`] because they cannot roll back the
+    /// server-side membership change.
+    pub async fn leave_group(
+        &mut self,
+        master_key: &GroupMasterKeyBytes,
+    ) -> Result<LeaveGroupOutcome, Error<S::Error>> {
+        let own_aci = self.registration_data().service_ids.aci();
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key));
+        let expected_group_id = secret_params.get_group_identifier();
+        let operations = GroupOperations::new(secret_params);
+        let mut groups_manager = self.groups_manager().await?;
+        let push_service = self.identified_push_service();
+
+        for attempt in 0..GROUP_LEAVE_REVISION_ATTEMPTS {
+            let Some(encrypted) =
+                fetch_authoritative_group(&mut groups_manager, &push_service, master_key).await?
+            else {
+                return Ok(self.finish_already_left_group(master_key).await);
+            };
+            let current_group = decrypt_group(master_key, encrypted)?;
+            if !group_has_member(&current_group, own_aci) {
+                return Ok(self.finish_already_left_group(master_key).await);
+            }
+
+            let next_revision = current_group
+                .version
+                .checked_add(1)
+                .ok_or(Error::InvalidGroupLeaveChange)?;
+            let actions = build_leave_group_actions(&operations, own_aci, next_revision)
+                .map_err(ServiceError::from)?;
+            let authorization = groups_manager
+                .get_authorization_for_today(&mut rand::rng(), secret_params)
+                .await?;
+            let response = push_service
+                .request(
+                    Method::PATCH,
+                    Endpoint::storage(GROUPS_V2_ENDPOINT),
+                    HttpAuthOverride::Identified(authorization),
+                )?
+                .header(CONTENT_TYPE, "application/x-protobuf")
+                .body(actions.encode_to_vec())
+                .send()
+                .await
+                .map_err(ServiceError::from)?;
+
+            if response.status() == StatusCode::CONFLICT {
+                if attempt + 1 < GROUP_LEAVE_REVISION_ATTEMPTS {
+                    continue;
+                }
+                return Err(Error::GroupRevisionConflict);
+            }
+            if !response.status().is_success() {
+                return Err(groups_v2_response_error(response).await.into());
+            }
+            let notification_timestamp =
+                signal_response_timestamp(response.headers()).unwrap_or_else(|| {
+                    warn!("Signal group leave response had no valid X-Signal-Timestamp; using local time");
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64
+                });
+
+            let mut updated_group = Group::from(current_group);
+            updated_group.members.retain(|member| member.aci != own_aci);
+            updated_group.revision = next_revision;
+
+            let signed_change = match response.bytes().await {
+                Ok(bytes) => {
+                    let validation = (|| -> Result<_, ServiceError> {
+                        let response = GroupChangeResponse::decode(bytes)?;
+                        let signed = response.group_change.ok_or(ServiceError::GroupsV2Error)?;
+                        let signature = signed
+                            .server_signature
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| ServiceError::GroupsV2Error)?;
+                        self.state
+                            .service_configuration()
+                            .zkgroup_server_public_params
+                            .verify_signature(&signed.actions, signature)
+                            .map_err(ServiceError::from)?;
+                        let decoded = operations
+                            .decrypt_group_change(signed.clone())
+                            .map_err(ServiceError::from)?;
+                        if !is_expected_leave_change(
+                            &decoded,
+                            expected_group_id,
+                            own_aci,
+                            next_revision,
+                        ) {
+                            return Err(ServiceError::GroupsV2Error);
+                        }
+                        Ok(signed)
+                    })();
+                    match validation {
+                        Ok(change) => Some(change),
+                        Err(error) => {
+                            warn!(%error, "Signal accepted the group leave but returned an invalid signed change");
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "Signal accepted the group leave but its signed change could not be read");
+                    None
+                }
+            };
+
+            if signed_change.is_none() {
+                let authoritative_group =
+                    fetch_authoritative_group(&mut groups_manager, &push_service, master_key)
+                        .await?
+                        .map(|encrypted| decrypt_group(master_key, encrypted))
+                        .transpose()?;
+                if let Some(confirmed_group) =
+                    confirmed_group_after_leave(authoritative_group, own_aci)
+                        .map_err(|_| Error::InvalidGroupLeaveChange)?
+                {
+                    updated_group = confirmed_group;
+                }
+            }
+
+            return Ok(self
+                .finish_accepted_group_leave(
+                    master_key,
+                    updated_group,
+                    next_revision,
+                    notification_timestamp,
+                    signed_change,
+                )
+                .await);
+        }
+
+        Err(Error::GroupRevisionConflict)
+    }
+
+    async fn finish_already_left_group(
+        &self,
+        master_key: &GroupMasterKeyBytes,
+    ) -> LeaveGroupOutcome {
+        let local_group_removed = match self.store().remove_group(*master_key).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "Signal group was already left but cached state could not be removed");
+                false
+            }
+        };
+        LeaveGroupOutcome {
+            peer_notification_sent: true,
+            local_group_removed,
+        }
+    }
+
+    async fn finish_accepted_group_leave(
+        &mut self,
+        master_key: &GroupMasterKeyBytes,
+        updated_group: Group,
+        revision: u32,
+        timestamp: u64,
+        signed_change: Option<libsignal_service::proto::GroupChange>,
+    ) -> LeaveGroupOutcome {
+        let prepared = match self.store().save_group(*master_key, updated_group).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "Signal group leave succeeded but updated state could not be saved");
+                false
+            }
+        };
+        let peer_notification_sent = if prepared {
+            if let Some(signed_change) = signed_change {
+                let message = DataMessage {
+                    timestamp: Some(timestamp),
+                    group_v2: Some(GroupContextV2 {
+                        master_key: Some(master_key.to_vec()),
+                        revision: Some(revision),
+                        group_change: Some(signed_change.encode_to_vec()),
+                    }),
+                    ..Default::default()
+                };
+                match self
+                    .send_message_to_group(master_key, message, timestamp)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(%error, "Signal group leave succeeded but remaining members could not be notified");
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let local_group_removed = match self.store().remove_group(*master_key).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "Signal group leave succeeded but cached state could not be removed");
+                false
+            }
+        };
+
+        LeaveGroupOutcome {
+            peer_notification_sent,
+            local_group_removed,
+        }
+    }
+
     /// Starts receiving and storing messages.
     ///
     /// As a client, it is heavily recommended to process incoming messages and wait for the `Received::QueueEmpty` messages
@@ -579,6 +1292,9 @@ impl<S: Store> Manager<S, Registered> {
     ) -> Result<impl Stream<Item = Received>, Error<S::Error>> {
         struct StreamState<Receiver, Store, AciStore, PniStore> {
             store: Store,
+            contact_updates: ContactUpdateCoordinator,
+            profile_workers: ContactProfileWorkerQueue,
+            queue_empty_pending: bool,
             identified_websocket: SignalWebSocket<websocket::Identified>,
             unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
             encrypted_messages: Receiver,
@@ -630,6 +1346,9 @@ impl<S: Store> Manager<S, Registered> {
 
         let init = StreamState {
             store: self.store.clone(),
+            contact_updates: self.state.contact_updates.clone(),
+            profile_workers: ContactProfileWorkerQueue::default(),
+            queue_empty_pending: false,
             identified_websocket,
             unidentified_websocket: self.unidentified_websocket().await?,
             encrypted_messages: Box::pin(encrypted_messages.stream()),
@@ -648,7 +1367,37 @@ impl<S: Store> Manager<S, Registered> {
         let incoming_messages_stream = futures::stream::unfold(init, |mut state| {
             async move {
                 loop {
-                    match state.encrypted_messages.next().await {
+                    if state.queue_empty_pending && state.profile_workers.is_empty() {
+                        state.queue_empty_pending = false;
+                        return Some((Received::QueueEmpty, state));
+                    }
+
+                    let incoming = if state.profile_workers.is_empty() {
+                        state.encrypted_messages.next().await
+                    } else {
+                        tokio::select! {
+                            biased;
+                            completed = state.profile_workers.workers.next() => {
+                                if let Some(sender_uuid) = completed {
+                                    state.profile_workers.complete(sender_uuid);
+                                    if state.contact_updates
+                                        .has_pending_profile_update(sender_uuid)
+                                        .await
+                                    {
+                                        state.profile_workers.start(
+                                            state.store.clone(),
+                                            state.identified_websocket.clone(),
+                                            state.contact_updates.clone(),
+                                            sender_uuid,
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                            incoming = state.encrypted_messages.next() => incoming,
+                        }
+                    };
+                    match incoming {
                         Some(Ok(Incoming::Envelope(envelope))) => {
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
@@ -797,10 +1546,12 @@ impl<S: Store> Manager<S, Registered> {
                                             Ok(contacts) => {
                                                 info!("saving contacts");
                                                 for contact in contacts.filter_map(Result::ok) {
-                                                    if let Err(error) = state
-                                                        .store
-                                                        .save_contact(&contact.into())
-                                                        .await
+                                                    if let Err(error) = save_synchronized_contact(
+                                                        &mut state.store,
+                                                        &state.contact_updates,
+                                                        contact,
+                                                    )
+                                                    .await
                                                     {
                                                         warn!(%error, "failed to save contacts");
                                                         break;
@@ -950,6 +1701,8 @@ impl<S: Store> Manager<S, Registered> {
                                     if let Err(error) = save_message(
                                         &mut state.store,
                                         &mut state.identified_websocket,
+                                        &state.contact_updates,
+                                        Some(&mut state.profile_workers),
                                         content.clone(),
                                         None,
                                     )
@@ -975,7 +1728,7 @@ impl<S: Store> Manager<S, Registered> {
                         }
                         Some(Ok(Incoming::QueueEmpty)) => {
                             debug!("got empty queue");
-                            if state.account_entropy_pool.is_none() {
+                            if !state.queue_empty_pending && state.account_entropy_pool.is_none() {
                                 debug!("device does not have the needed keys; requesting from primary device");
 
                                 let mut message_sender = state.message_sender.clone();
@@ -997,6 +1750,10 @@ impl<S: Store> Manager<S, Registered> {
                                         warn!(%error, "Error sending blocked contacts to other devices");
                                     }
                                 });
+                            }
+                            if !state.profile_workers.is_empty() {
+                                state.queue_empty_pending = true;
+                                continue;
                             }
                             return Some((Received::QueueEmpty, state));
                         }
@@ -1106,7 +1863,7 @@ impl<S: Store> Manager<S, Registered> {
         sender
             .send_message(
                 &recipient,
-                unidentified_access,
+                unidentified_access.as_ref(),
                 content_body.clone(),
                 timestamp,
                 include_pni_signature,
@@ -1136,6 +1893,8 @@ impl<S: Store> Manager<S, Registered> {
         save_message(
             &mut self.store,
             &mut identified_websocket,
+            &self.state.contact_updates,
+            None,
             content,
             Some(thread),
         )
@@ -1265,6 +2024,8 @@ impl<S: Store> Manager<S, Registered> {
         save_message(
             &mut self.store,
             &mut identified_websocket,
+            &self.state.contact_updates,
+            None,
             content,
             Some(thread),
         )
@@ -1310,27 +2071,65 @@ impl<S: Store> Manager<S, Registered> {
         &self,
         attachment_pointer: &AttachmentPointer,
     ) -> Result<Vec<u8>, Error<S::Error>> {
+        self.get_attachment_inner(attachment_pointer, None).await
+    }
+
+    /// Downloads and decrypts a single attachment, rejecting it when its plaintext exceeds
+    /// `max_size`.
+    ///
+    /// The download itself is bounded to include Signal's privacy padding and attachment
+    /// encryption overhead. The encrypted stream is stopped as soon as it exceeds that bound.
+    pub async fn get_attachment_with_size_limit(
+        &self,
+        attachment_pointer: &AttachmentPointer,
+        max_size: usize,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
+        self.get_attachment_inner(attachment_pointer, Some(max_size))
+            .await
+    }
+
+    async fn get_attachment_inner(
+        &self,
+        attachment_pointer: &AttachmentPointer,
+        max_size: Option<usize>,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
         let expected_digest = attachment_pointer
             .digest
             .as_ref()
             .ok_or_else(|| Error::UnexpectedAttachmentChecksum)?;
 
+        let plaintext_len = attachment_pointer.size.and_then(|len| len.try_into().ok());
+        if let (Some(max_size), Some(plaintext_len)) = (max_size, plaintext_len) {
+            if plaintext_len > max_size {
+                return Err(Error::AttachmentSizeLimitExceeded { max_size });
+            }
+        }
+
         let mut service = self.identified_push_service();
         let mut attachment_stream = service.get_attachment(attachment_pointer).await?;
 
-        let plaintext_len = attachment_pointer.size.and_then(|len| len.try_into().ok());
-
         // We need the whole file for the crypto to check out
-        let mut ciphertext = Vec::with_capacity(plaintext_len.unwrap_or(0));
-        let size_bytes = attachment_stream
-            .stream
-            .read_to_end(&mut ciphertext)
-            .await?;
+        let ciphertext_limit = max_size.map(attachment_ciphertext_size_limit);
+        let Some(mut ciphertext) = read_attachment_ciphertext(
+            &mut attachment_stream.stream,
+            plaintext_len.unwrap_or(0),
+            ciphertext_limit,
+        )
+        .await?
+        else {
+            return Err(Error::AttachmentSizeLimitExceeded {
+                max_size: max_size.expect("ciphertext limit requires plaintext limit"),
+            });
+        };
+        let size_bytes = ciphertext.len();
         trace!(size_bytes, "downloaded encrypted attachment");
 
         let digest = sha2::Sha256::digest(&ciphertext);
         if &digest[..] != expected_digest {
             return Err(Error::UnexpectedAttachmentChecksum);
+        }
+        if !is_valid_attachment_ciphertext_size(ciphertext.len()) {
+            return Err(Error::InvalidAttachmentCiphertext);
         }
 
         let key: [u8; 64] = attachment_pointer.key().try_into()?;
@@ -1352,6 +2151,12 @@ impl<S: Store> Manager<S, Registered> {
             if len < ciphertext.len() {
                 // remove padding
                 ciphertext.truncate(len);
+            }
+        }
+
+        if let Some(max_size) = max_size {
+            if ciphertext.len() > max_size {
+                return Err(Error::AttachmentSizeLimitExceeded { max_size });
             }
         }
 
@@ -1631,6 +2436,62 @@ impl<S: Store> Manager<S, Registered> {
     }
 }
 
+fn attachment_ciphertext_size_limit(max_plaintext_size: usize) -> usize {
+    let max_plaintext_size = max_plaintext_size as u128;
+    // Signal pads to the next 5% privacy bucket, with a minimum padded size of 541 bytes.
+    // Adding a full 5% is a conservative upper bound for that bucket.
+    let privacy_padded_size = max_plaintext_size
+        .saturating_add(max_plaintext_size.div_ceil(ATTACHMENT_PRIVACY_PADDING_DENOMINATOR))
+        .max(ATTACHMENT_MIN_PADDED_PLAINTEXT_SIZE);
+    // Attachments contain a 16-byte IV, PKCS#7 padded AES-CBC ciphertext, and a 32-byte MAC.
+    // PKCS#7 always appends at least one byte, including a full block for block-aligned input.
+    let encrypted_size = ATTACHMENT_IV_SIZE
+        .saturating_add(
+            privacy_padded_size
+                .saturating_div(ATTACHMENT_CIPHER_BLOCK_SIZE)
+                .saturating_add(1)
+                .saturating_mul(ATTACHMENT_CIPHER_BLOCK_SIZE),
+        )
+        .saturating_add(ATTACHMENT_MAC_SIZE);
+
+    usize::try_from(encrypted_size).unwrap_or(usize::MAX)
+}
+
+fn is_valid_attachment_ciphertext_size(ciphertext_size: usize) -> bool {
+    let unencrypted_overhead = (ATTACHMENT_IV_SIZE + ATTACHMENT_MAC_SIZE) as usize;
+    ciphertext_size >= ATTACHMENT_MIN_CIPHERTEXT_SIZE
+        && (ciphertext_size - unencrypted_overhead)
+            .is_multiple_of(ATTACHMENT_CIPHER_BLOCK_SIZE as usize)
+}
+
+async fn read_attachment_ciphertext<R>(
+    reader: &mut R,
+    initial_capacity: usize,
+    max_ciphertext_size: Option<usize>,
+) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: futures::AsyncRead + Unpin,
+{
+    let initial_capacity = max_ciphertext_size
+        .map(|limit| initial_capacity.min(limit))
+        .unwrap_or(initial_capacity);
+    let mut ciphertext = Vec::with_capacity(initial_capacity);
+
+    if let Some(max_ciphertext_size) = max_ciphertext_size {
+        let read_limit = u64::try_from(max_ciphertext_size)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        reader.take(read_limit).read_to_end(&mut ciphertext).await?;
+        if ciphertext.len() > max_ciphertext_size {
+            return Ok(None);
+        }
+    } else {
+        reader.read_to_end(&mut ciphertext).await?;
+    }
+
+    Ok(Some(ciphertext))
+}
+
 /// Set the timestamp in any DataMessage so it matches its envelope's
 fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64) {
     match content_body {
@@ -1777,11 +2638,16 @@ async fn download_sticker<C: ContentsStore>(
 async fn save_message<S: Store>(
     store: &mut S,
     identified_websocket: &mut websocket::SignalWebSocket<websocket::Identified>,
+    contact_updates: &ContactUpdateCoordinator,
+    mut profile_workers: Option<&mut ContactProfileWorkerQueue>,
     message: Content,
     override_thread: Option<Thread>,
 ) -> Result<(), Error<S::Error>> {
     // derive the thread from the message type
+    let should_update_contact_profile = override_thread.is_none() && profile_workers.is_some();
     let thread = override_thread.unwrap_or(Thread::try_from(&message)?);
+    let profile_update_timestamp = message.timestamp();
+    let mut contact_profile_update = None;
 
     // only save DataMessage and SynchronizeMessage (sent)
     let message = match message.body {
@@ -1809,38 +2675,29 @@ async fn save_message<S: Store>(
             ..
         }) => {
             // update recipient profile key if changed
-            if let Some(profile_key_bytes) = profile_key.clone().and_then(|p| p.try_into().ok()) {
-                let sender = message.metadata.sender;
-                let profile_key = ProfileKey::create(profile_key_bytes);
-                debug!(sender = %sender.service_id_string(), "inserting profile key for");
+            if should_update_contact_profile {
+                if let Some(profile_key_bytes) = profile_key.clone().and_then(|p| p.try_into().ok())
+                {
+                    let sender = message.metadata.sender;
+                    let profile_key = ProfileKey::create(profile_key_bytes);
+                    debug!(sender = %sender.service_id_string(), "inserting profile key for");
 
-                // Either:
-                // - insert a new contact with the profile information
-                // - update the contact if the profile key has changed
-                // TODO: mark this contact as "created by us" maybe to know whether we should update it or not
-                // NOTE: this needs to happen in the background!
-                let store_inner = store.clone();
-                let websocket_inner = identified_websocket.clone();
-                let data_message_inner = data_message.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = upsert_contact_from_profile(
-                        store_inner,
-                        websocket_inner,
-                        &data_message_inner,
+                    contact_profile_update = Some(ContactProfileUpdate {
                         sender,
                         profile_key,
-                    )
-                    .await
-                    {
-                        error!(%error, "failed to upsert newly seen contact!");
-                    }
-                });
+                        observation_timestamp: profile_update_timestamp,
+                        expire_timer: data_message.expire_timer.unwrap_or_default(),
+                        expire_timer_version: data_message.expire_timer_version.unwrap_or(1),
+                    });
+                }
             }
 
             // Note: The expire timer fields of data messages are only for contacts.
             // Expire timers are handled for groups via upsert_group due to a revision change.
-            if let Thread::Contact(_) = thread {
+            if let Thread::Contact(service_id) = &thread {
                 let version = data_message.expire_timer_version.unwrap_or(1);
+                let contact_lock = contact_updates.contact_lock(service_id.raw_uuid()).await;
+                let _contact_guard = contact_lock.lock().await;
                 store
                     .update_expire_timer(
                         &thread,
@@ -1964,59 +2821,330 @@ async fn save_message<S: Store>(
         store.save_message(&thread, message).await?;
     }
 
+    // Contact data is persisted before optional profile enrichment. One local worker per contact
+    // coalesces observations without delaying message delivery.
+    if let Some(profile_update) = contact_profile_update {
+        let Some(aci) = profile_update.sender.aci() else {
+            debug!("not storing profile for PNI contact");
+            return Ok(());
+        };
+        let sender_uuid: Uuid = aci.into();
+        contact_updates
+            .enqueue_profile_update(sender_uuid, profile_update)
+            .await;
+        if let Some(profile_workers) = profile_workers.as_deref_mut() {
+            profile_workers.start(
+                store.clone(),
+                identified_websocket.clone(),
+                contact_updates.clone(),
+                sender_uuid,
+            );
+        }
+    }
+
     Ok(())
 }
 
-async fn upsert_contact_from_profile<S: Store>(
-    mut store: S,
-    mut identified_websocket: SignalWebSocket<websocket::Identified>,
-    data_message: &DataMessage,
-    sender: ServiceId,
-    profile_key: ProfileKey,
-) -> Result<(), Error<<S as Store>::Error>> {
-    if store.contact_by_id(&sender).await?.is_none()
-        || store
-            .profile_key(&sender)
-            .await?
-            .is_none_or(|p| p.bytes != profile_key.bytes)
-    {
-        if let Some(aci) = sender.aci() {
-            let sender_uuid: Uuid = aci.into();
-            let encrypted_profile = identified_websocket
-                .retrieve_profile_by_id(aci, Some(profile_key))
-                .await?;
-            let profile_cipher = ProfileCipher::new(profile_key);
-            let decrypted_profile = profile_cipher.decrypt(encrypted_profile).unwrap();
+fn profile_display_name(profile: &Profile) -> String {
+    profile
+        .name
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default()
+}
 
-            let contact = Contact {
-                uuid: sender_uuid,
-                phone_number: None,
-                name: decrypted_profile
-                    .name
-                    // FIXME: this assumes [firstname] [lastname]
-                    .map(|pn| {
-                        if let Some(family_name) = pn.family_name {
-                            format!("{} {}", pn.given_name, family_name)
-                        } else {
-                            pn.given_name
-                        }
-                    })
-                    .unwrap_or_default(),
-                profile_key: profile_key.bytes.to_vec(),
-                expire_timer: data_message.expire_timer.unwrap_or_default(),
-                expire_timer_version: data_message.expire_timer_version.unwrap_or(1),
-                inbox_position: 0,
-                avatar: None,
-                verified: Verified::default(),
-            };
+fn merge_synchronized_contact(
+    mut synchronized: Contact,
+    existing: Option<Contact>,
+    stored_profile_key: Option<ProfileKey>,
+    stored_profile: Option<&Profile>,
+) -> Contact {
+    let existing = existing.as_ref();
 
-            info!(%sender_uuid, "saved contact on first sight");
-            store.save_contact(&contact).await?;
-            store.upsert_profile_key(&sender_uuid, profile_key).await?;
+    if synchronized.name.is_empty() {
+        let cached_profile_name = stored_profile
+            .map(profile_display_name)
+            .filter(|name| !name.is_empty());
+        let legacy_profile_name = if stored_profile.is_none() {
+            existing
+                .filter(|contact| {
+                    contact.phone_number.is_none()
+                        && contact.profile_key.len() == 32
+                        && stored_profile_key.as_ref().is_some_and(|profile_key| {
+                            contact.profile_key.as_slice() == profile_key.bytes.as_slice()
+                        })
+                })
+                .map(|contact| contact.name.clone())
+                .filter(|name| !name.is_empty())
         } else {
-            debug!("not storing profile for PNI contact");
+            None
+        };
+        if let Some(name) = cached_profile_name.or(legacy_profile_name) {
+            synchronized.name = name;
         }
     }
+
+    if let Some(existing) = existing {
+        synchronized.verified = existing.verified.clone();
+    }
+    synchronized.profile_key = stored_profile_key
+        .map(|profile_key| profile_key.bytes.to_vec())
+        .or_else(|| {
+            existing
+                .filter(|contact| contact.profile_key.len() == 32)
+                .map(|contact| contact.profile_key.clone())
+        })
+        .unwrap_or_default();
+
+    synchronized
+}
+
+async fn save_synchronized_contact<S: Store>(
+    store: &mut S,
+    contact_updates: &ContactUpdateCoordinator,
+    contact: libsignal_service::models::Contact,
+) -> Result<(), S::Error> {
+    let synchronized: Contact = contact.into();
+    let uuid = synchronized.uuid;
+    let contact_lock = contact_updates.contact_lock(uuid).await;
+    let _contact_guard = contact_lock.lock().await;
+    let service_id = ServiceId::Aci(Aci::from(uuid));
+    let existing = store.contact_by_id(&service_id).await?;
+    let stored_profile_key = store.profile_key(&service_id).await?;
+    let stored_profile = match (synchronized.name.is_empty(), stored_profile_key) {
+        (true, Some(profile_key)) => store.profile(uuid, profile_key).await?,
+        _ => None,
+    };
+    let contact = merge_synchronized_contact(
+        synchronized,
+        existing,
+        stored_profile_key,
+        stored_profile.as_ref(),
+    );
+    store.save_contact(&contact).await
+}
+
+fn needs_profile_contact_upsert(
+    contact: Option<&Contact>,
+    stored_profile_key: Option<&ProfileKey>,
+    incoming_profile_key: &ProfileKey,
+) -> bool {
+    stored_profile_key != Some(incoming_profile_key)
+        || contact.is_none_or(|contact| {
+            contact.name.is_empty()
+                || contact.profile_key.as_slice() != incoming_profile_key.bytes.as_slice()
+        })
+}
+
+fn merge_profile_contact(
+    uuid: Uuid,
+    existing: Option<Contact>,
+    previous_profile: Option<&Profile>,
+    profile: &Profile,
+    profile_key: ProfileKey,
+    new_contact_timer: u32,
+    new_contact_timer_version: u32,
+) -> Contact {
+    let profile_name = profile_display_name(profile);
+    if let Some(mut existing) = existing {
+        let previous_profile_name = previous_profile.map(profile_display_name);
+        let existing_name_is_profile_owned = existing.phone_number.is_none()
+            && previous_profile_name
+                .as_ref()
+                .is_some_and(|name| !name.is_empty() && name == &existing.name);
+        if existing.name.is_empty() || existing_name_is_profile_owned {
+            existing.name = profile_name;
+        }
+        existing.profile_key = profile_key.bytes.to_vec();
+        existing
+    } else {
+        Contact {
+            uuid,
+            phone_number: None,
+            name: profile_name,
+            profile_key: profile_key.bytes.to_vec(),
+            expire_timer: new_contact_timer,
+            expire_timer_version: new_contact_timer_version,
+            inbox_position: 0,
+            avatar: None,
+            verified: Verified::default(),
+        }
+    }
+}
+
+async fn run_contact_profile_worker<S: Store>(
+    mut store: S,
+    mut identified_websocket: SignalWebSocket<websocket::Identified>,
+    contact_updates: ContactUpdateCoordinator,
+    sender_uuid: Uuid,
+) {
+    while let Some(queued) = contact_updates.take_profile_update(sender_uuid).await {
+        let observation_timestamp = queued.update.observation_timestamp;
+        if let Err(error) = process_contact_profile_update(
+            &mut store,
+            &mut identified_websocket,
+            &contact_updates,
+            sender_uuid,
+            queued,
+        )
+        .await
+        {
+            error!(
+                %error,
+                %sender_uuid,
+                observation_timestamp,
+                "failed to update contact profile"
+            );
+        }
+    }
+}
+
+async fn process_contact_profile_update<S: Store>(
+    store: &mut S,
+    identified_websocket: &mut SignalWebSocket<websocket::Identified>,
+    contact_updates: &ContactUpdateCoordinator,
+    sender_uuid: Uuid,
+    queued: QueuedContactProfileUpdate,
+) -> Result<(), Error<<S as Store>::Error>> {
+    let queued = {
+        let contact_lock = contact_updates.contact_lock(sender_uuid).await;
+        let _contact_guard = contact_lock.lock().await;
+        let Some(queued) = contact_updates
+            .coalesce_current_profile_update(sender_uuid, queued)
+            .await
+        else {
+            debug!(%sender_uuid, "ignoring superseded contact profile update");
+            return Ok(());
+        };
+        let update = &queued.update;
+        let sender = update.sender;
+        let profile_key = update.profile_key;
+        let existing = store.contact_by_id(&sender).await?;
+        let stored_profile_key = store.profile_key(&sender).await?;
+        if !needs_profile_contact_upsert(
+            existing.as_ref(),
+            stored_profile_key.as_ref(),
+            &profile_key,
+        ) {
+            return Ok(());
+        }
+
+        let previous_profile = match stored_profile_key {
+            Some(stored_profile_key) => store.profile(sender_uuid, stored_profile_key).await?,
+            None => None,
+        };
+        let profile_key_is_unchanged = stored_profile_key.as_ref() == Some(&profile_key);
+        let latest_contact = store.contact_by_id(&sender).await?;
+
+        if profile_key_is_unchanged {
+            if let Some(profile) = previous_profile.as_ref() {
+                let profile_name = profile_display_name(profile);
+                if latest_contact.as_ref().is_some_and(|contact| {
+                    contact.name.is_empty()
+                        && profile_name.is_empty()
+                        && contact.profile_key.as_slice() == profile_key.bytes.as_slice()
+                }) {
+                    return Ok(());
+                }
+
+                let Some(queued) = contact_updates
+                    .coalesce_current_profile_update(sender_uuid, queued.clone())
+                    .await
+                else {
+                    return Ok(());
+                };
+                let update = &queued.update;
+                let contact = merge_profile_contact(
+                    sender_uuid,
+                    latest_contact,
+                    previous_profile.as_ref(),
+                    profile,
+                    update.profile_key,
+                    update.expire_timer,
+                    update.expire_timer_version,
+                );
+                store.save_contact(&contact).await?;
+                return Ok(());
+            }
+
+            if let Some(mut contact) = latest_contact {
+                if !contact.name.is_empty() {
+                    if contact_updates
+                        .coalesce_current_profile_update(sender_uuid, queued.clone())
+                        .await
+                        .is_none()
+                    {
+                        return Ok(());
+                    }
+                    contact.profile_key = profile_key.bytes.to_vec();
+                    store.save_contact(&contact).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        queued
+    };
+
+    let sender = queued.update.sender;
+    let Some(aci) = sender.aci() else {
+        return Ok(());
+    };
+    let profile_key = queued.update.profile_key;
+    let encrypted_profile = match tokio::time::timeout(
+        CONTACT_PROFILE_FETCH_TIMEOUT,
+        identified_websocket.retrieve_profile_by_id(aci, Some(profile_key)),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            warn!(%sender_uuid, "timed out retrieving contact profile");
+            return Ok(());
+        }
+    };
+    let profile = ProfileCipher::new(profile_key).decrypt(encrypted_profile)?;
+
+    let contact_lock = contact_updates.contact_lock(sender_uuid).await;
+    let _contact_guard = contact_lock.lock().await;
+    let Some(queued) = contact_updates
+        .coalesce_current_profile_update(sender_uuid, queued)
+        .await
+    else {
+        debug!(%sender_uuid, "discarding superseded contact profile response");
+        return Ok(());
+    };
+    let update = &queued.update;
+    let stored_profile_key = store.profile_key(&update.sender).await?;
+    let previous_profile = match stored_profile_key {
+        Some(stored_profile_key) => store.profile(sender_uuid, stored_profile_key).await?,
+        None => None,
+    };
+    let Some(queued) = contact_updates
+        .coalesce_current_profile_update(sender_uuid, queued)
+        .await
+    else {
+        debug!(%sender_uuid, "discarding superseded contact profile response");
+        return Ok(());
+    };
+    let update = &queued.update;
+    store
+        .save_profile(sender_uuid, update.profile_key, profile.clone())
+        .await?;
+
+    let latest_contact = store.contact_by_id(&update.sender).await?;
+    let contact = merge_profile_contact(
+        sender_uuid,
+        latest_contact,
+        previous_profile.as_ref(),
+        &profile,
+        update.profile_key,
+        update.expire_timer,
+        update.expire_timer_version,
+    );
+
+    info!(%sender_uuid, "saved contact profile");
+    store.save_contact(&contact).await?;
     Ok(())
 }
 
@@ -2085,4 +3213,811 @@ async fn register_pre_keys<S: Store>(
 
     trace!("registered pre keys");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::io::Cursor;
+    use libsignal_service::attachment_cipher::encrypt_in_place;
+    use libsignal_service::groups_v2::{Group as ServiceGroup, Member as ServiceMember, Role};
+    use libsignal_service::proto::manifest_record::{identifier::Type, Identifier};
+    use libsignal_service::proto::{
+        GroupChange as ProtoGroupChange, GroupV2Record, ManifestRecord, StorageRecord,
+    };
+    use reqwest::header::{HeaderName, HeaderValue};
+
+    fn aci(value: u128) -> Aci {
+        Aci::from(Uuid::from_u128(value))
+    }
+
+    fn signal_sender_ciphertext_size(plaintext_size: usize) -> usize {
+        let padded_size = std::cmp::max(
+            ATTACHMENT_MIN_PADDED_PLAINTEXT_SIZE as usize,
+            1.05f64
+                .powf((plaintext_size as f64).log(1.05).ceil())
+                .floor() as usize,
+        );
+        ATTACHMENT_IV_SIZE as usize
+            + (padded_size / ATTACHMENT_CIPHER_BLOCK_SIZE as usize + 1)
+                * ATTACHMENT_CIPHER_BLOCK_SIZE as usize
+            + ATTACHMENT_MAC_SIZE as usize
+    }
+
+    #[test]
+    fn attachment_ciphertext_limit_includes_signal_padding_and_encryption_overhead() {
+        assert_eq!(attachment_ciphertext_size_limit(0), 592);
+        assert_eq!(attachment_ciphertext_size_limit(1), 592);
+        assert_eq!(
+            attachment_ciphertext_size_limit(25 * 1024 * 1024),
+            27_525_184
+        );
+
+        for plaintext_size in [
+            0,
+            1,
+            540,
+            541,
+            542,
+            1024,
+            100 * 1024,
+            25 * 1024 * 1024,
+            u32::MAX as usize,
+        ] {
+            assert!(
+                signal_sender_ciphertext_size(plaintext_size)
+                    <= attachment_ciphertext_size_limit(plaintext_size),
+                "ciphertext bound was too small for {plaintext_size} plaintext bytes"
+            );
+        }
+
+        let mut exponent = 0;
+        loop {
+            let boundary = 1.05f64.powi(exponent);
+            if boundary > u32::MAX as f64 + 2.0 {
+                break;
+            }
+            let first_candidate = boundary.floor() as i64 - 2;
+            let last_candidate = boundary.ceil() as i64 + 2;
+            for plaintext_size in first_candidate..=last_candidate {
+                if !(0..=u32::MAX as i64).contains(&plaintext_size) {
+                    continue;
+                }
+                let plaintext_size = plaintext_size as usize;
+                assert!(
+                    signal_sender_ciphertext_size(plaintext_size)
+                        <= attachment_ciphertext_size_limit(plaintext_size),
+                    "ciphertext bound was too small at bucket edge {plaintext_size}"
+                );
+            }
+            exponent += 1;
+        }
+    }
+
+    #[test]
+    fn attachment_ciphertext_framing_rejects_lengths_that_cannot_be_decrypted() {
+        for ciphertext_size in [0, 31, 32, 47, 48, 63, 65, 79] {
+            assert!(!is_valid_attachment_ciphertext_size(ciphertext_size));
+        }
+        for ciphertext_size in [64, 80, 96, 592] {
+            assert!(is_valid_attachment_ciphertext_size(ciphertext_size));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_attachment_reader_stops_after_first_excess_byte() {
+        let max_ciphertext_size = 64;
+        let mut reader = Cursor::new(vec![7; max_ciphertext_size + 32]);
+
+        let ciphertext = read_attachment_ciphertext(&mut reader, 0, Some(max_ciphertext_size))
+            .await
+            .unwrap();
+
+        assert!(ciphertext.is_none());
+        assert_eq!(reader.position(), (max_ciphertext_size + 1) as u64);
+    }
+
+    #[tokio::test]
+    async fn bounded_attachment_reader_accepts_the_exact_limit() {
+        let expected = vec![7; 64];
+        let mut reader = Cursor::new(expected.clone());
+
+        let ciphertext = read_attachment_ciphertext(&mut reader, 0, Some(expected.len()))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ciphertext, expected);
+        assert_eq!(reader.position(), expected.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn bounded_attachment_reader_preserves_digest_and_decryption_input() {
+        let key = [9; 64];
+        let plaintext = b"bounded attachment";
+        let mut encrypted = plaintext.to_vec();
+        encrypted.resize(ATTACHMENT_MIN_PADDED_PLAINTEXT_SIZE as usize, 0);
+        encrypt_in_place([7; 16], key, &mut encrypted);
+        let expected_digest = sha2::Sha256::digest(&encrypted);
+        let ciphertext_limit = attachment_ciphertext_size_limit(plaintext.len());
+        let mut reader = Cursor::new(encrypted);
+
+        let mut downloaded = read_attachment_ciphertext(&mut reader, 0, Some(ciphertext_limit))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(sha2::Sha256::digest(&downloaded), expected_digest);
+        decrypt_in_place(key, &mut downloaded).unwrap();
+        downloaded.truncate(plaintext.len());
+        assert_eq!(downloaded, plaintext);
+    }
+
+    fn contact(name: &str, profile_key: Vec<u8>) -> Contact {
+        Contact {
+            uuid: Uuid::from_u128(1),
+            phone_number: None,
+            name: name.into(),
+            verified: Verified::default(),
+            profile_key,
+            expire_timer: 10,
+            expire_timer_version: 2,
+            inbox_position: 3,
+            avatar: None,
+        }
+    }
+
+    fn profile(name: Option<(&str, Option<&str>)>) -> Profile {
+        Profile {
+            name: name.map(|(given_name, family_name)| {
+                libsignal_service::profile_name::ProfileName {
+                    given_name: given_name.into(),
+                    family_name: family_name.map(Into::into),
+                }
+            }),
+            ..Profile::default()
+        }
+    }
+
+    fn contact_profile_update(
+        uuid: Uuid,
+        observation_timestamp: u64,
+        profile_key: ProfileKey,
+    ) -> ContactProfileUpdate {
+        ContactProfileUpdate {
+            sender: ServiceId::Aci(Aci::from(uuid)),
+            profile_key,
+            observation_timestamp,
+            expire_timer: 10,
+            expire_timer_version: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_update_order_uses_observation_sequence_not_content_timestamp() {
+        let coordinator = ContactUpdateCoordinator::default();
+        let uuid = Uuid::from_u128(1);
+        let first = contact_profile_update(uuid, u64::MAX, ProfileKey::create([7; 32]));
+        let later = contact_profile_update(uuid, 1, ProfileKey::create([8; 32]));
+
+        coordinator.enqueue_profile_update(uuid, first).await;
+        coordinator.enqueue_profile_update(uuid, later).await;
+        let queued = coordinator.take_profile_update(uuid).await.unwrap();
+
+        assert_eq!(queued.update.observation_timestamp, 1);
+        assert_eq!(queued.update.profile_key.bytes, [8; 32]);
+        assert_eq!(queued.observation.sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn same_key_profile_updates_coalesce_to_the_latest_payload() {
+        let coordinator = ContactUpdateCoordinator::default();
+        let uuid = Uuid::from_u128(1);
+        let profile_key = ProfileKey::create([7; 32]);
+        let first = contact_profile_update(uuid, 20, profile_key);
+        let mut latest = contact_profile_update(uuid, 21, profile_key);
+        latest.expire_timer = 30;
+        latest.expire_timer_version = 4;
+
+        coordinator.enqueue_profile_update(uuid, first).await;
+        let first_queued = coordinator.take_profile_update(uuid).await.unwrap();
+        coordinator.enqueue_profile_update(uuid, latest).await;
+        let coalesced = coordinator
+            .coalesce_current_profile_update(uuid, first_queued)
+            .await
+            .unwrap();
+
+        assert_eq!(coalesced.update.observation_timestamp, 21);
+        assert_eq!(coalesced.update.expire_timer, 30);
+        assert_eq!(coalesced.update.expire_timer_version, 4);
+        assert_eq!(coalesced.observation.sequence, 2);
+        assert!(coordinator.take_profile_update(uuid).await.is_none());
+    }
+
+    #[test]
+    fn queue_empty_waits_for_profile_workers_and_restart_has_no_active_flag() {
+        let workers = ContactProfileWorkerQueue::default();
+        assert!(workers.is_empty());
+
+        workers
+            .workers
+            .push(future::pending::<Uuid>().boxed_local());
+        assert!(!workers.is_empty());
+
+        drop(workers);
+        assert!(ContactProfileWorkerQueue::default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn contact_updates_share_a_lock_and_supersede_inflight_profiles() {
+        let coordinator = ContactUpdateCoordinator::default();
+        let uuid = Uuid::from_u128(1);
+        let old = contact_profile_update(uuid, 20, ProfileKey::create([7; 32]));
+        let new = contact_profile_update(uuid, 21, ProfileKey::create([8; 32]));
+        coordinator.enqueue_profile_update(uuid, old).await;
+        let old_queued = coordinator.take_profile_update(uuid).await.unwrap();
+        let old_lock = coordinator.contact_lock(uuid).await;
+        let new_lock = coordinator.contact_lock(uuid).await;
+        let old_guard = old_lock.lock().await;
+
+        assert!(Arc::ptr_eq(&old_lock, &new_lock));
+        assert!(new_lock.try_lock().is_err());
+        let mut enqueue_new = Box::pin(coordinator.enqueue_profile_update(uuid, new));
+        assert!(matches!(
+            futures::poll!(enqueue_new.as_mut()),
+            std::task::Poll::Pending
+        ));
+
+        drop(old_guard);
+        enqueue_new.await;
+        assert!(coordinator
+            .coalesce_current_profile_update(uuid, old_queued)
+            .await
+            .is_none());
+        let new_queued = coordinator.take_profile_update(uuid).await.unwrap();
+        assert_eq!(new_queued.update.profile_key.bytes, [8; 32]);
+        assert!(new_lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn empty_sync_uses_cached_profile_name_and_canonical_key() {
+        let profile_key = ProfileKey::create([7; 32]);
+        let cached_profile = profile(Some(("Profile", Some("Name"))));
+        let phone_number = "+12025550123".parse::<PhoneNumber>().unwrap();
+        let mut synchronized = contact("", Vec::new());
+        synchronized.phone_number = Some(phone_number.clone());
+        synchronized.expire_timer = 20;
+        synchronized.expire_timer_version = 4;
+        synchronized.inbox_position = 9;
+        let mut existing = contact("Legacy Profile", profile_key.bytes.to_vec());
+        existing.verified = Verified {
+            identity_key: Some(vec![5; 33]),
+            ..Verified::default()
+        };
+        let expected_verified = existing.verified.clone();
+
+        let merged = merge_synchronized_contact(
+            synchronized,
+            Some(existing),
+            Some(profile_key),
+            Some(&cached_profile),
+        );
+
+        assert_eq!(merged.name, "Profile Name");
+        assert_eq!(merged.profile_key, profile_key.bytes);
+        assert_eq!(merged.phone_number, Some(phone_number));
+        assert_eq!(merged.expire_timer, 20);
+        assert_eq!(merged.expire_timer_version, 4);
+        assert_eq!(merged.inbox_position, 9);
+        assert_eq!(merged.verified, expected_verified);
+    }
+
+    #[test]
+    fn nonempty_synchronized_name_wins_over_profile() {
+        let profile_key = ProfileKey::create([7; 32]);
+        let cached_profile = profile(Some(("Profile", None)));
+        let synchronized = contact("Address Book", Vec::new());
+
+        let merged = merge_synchronized_contact(
+            synchronized,
+            Some(contact("Old Profile", profile_key.bytes.to_vec())),
+            Some(profile_key),
+            Some(&cached_profile),
+        );
+
+        assert_eq!(merged.name, "Address Book");
+        assert_eq!(merged.profile_key, profile_key.bytes);
+    }
+
+    #[test]
+    fn legacy_empty_sync_keeps_a_profile_fallback_without_a_cached_profile() {
+        let profile_key = ProfileKey::create([7; 32]);
+
+        let merged = merge_synchronized_contact(
+            contact("", Vec::new()),
+            Some(contact("Legacy Profile", profile_key.bytes.to_vec())),
+            Some(profile_key),
+            None,
+        );
+
+        assert_eq!(merged.name, "Legacy Profile");
+        assert_eq!(merged.profile_key, profile_key.bytes);
+    }
+
+    #[test]
+    fn synchronized_contact_prefers_canonical_key_and_drops_a_malformed_orphan() {
+        let profile_key = ProfileKey::create([7; 32]);
+        let canonical = merge_synchronized_contact(
+            contact("Synced", Vec::new()),
+            Some(contact("Existing", vec![8; 32])),
+            Some(profile_key),
+            None,
+        );
+        let malformed_orphan = merge_synchronized_contact(
+            contact("Synced", Vec::new()),
+            Some(contact("Existing", vec![8; 31])),
+            None,
+            None,
+        );
+
+        assert_eq!(canonical.profile_key, profile_key.bytes);
+        assert!(malformed_orphan.profile_key.is_empty());
+    }
+
+    #[test]
+    fn profile_refresh_updates_a_known_profile_name() {
+        let old_profile = profile(Some(("Old", Some("Profile"))));
+        let new_profile = profile(Some(("New", Some("Profile"))));
+        let new_profile_key = ProfileKey::create([8; 32]);
+
+        let merged = merge_profile_contact(
+            Uuid::from_u128(1),
+            Some(contact("Old Profile", vec![7; 32])),
+            Some(&old_profile),
+            &new_profile,
+            new_profile_key,
+            30,
+            4,
+        );
+
+        assert_eq!(merged.name, "New Profile");
+        assert_eq!(merged.profile_key, new_profile_key.bytes);
+        assert_eq!(merged.expire_timer, 10);
+        assert_eq!(merged.expire_timer_version, 2);
+    }
+
+    #[test]
+    fn profile_refresh_preserves_synchronized_contact_fields() {
+        let old_profile = profile(Some(("Address", Some("Book"))));
+        let new_profile = profile(Some(("New", Some("Profile"))));
+        let new_profile_key = ProfileKey::create([8; 32]);
+        let phone_number = "+12025550123".parse::<PhoneNumber>().unwrap();
+        let mut existing = contact("Address Book", vec![7; 32]);
+        existing.phone_number = Some(phone_number.clone());
+        existing.expire_timer = 60;
+        existing.expire_timer_version = 6;
+        existing.inbox_position = 12;
+        existing.avatar = Some(libsignal_service::models::Attachment {
+            content_type: "image/png".into(),
+            reader: bytes::Bytes::from_static(b"avatar"),
+        });
+        existing.verified = Verified {
+            identity_key: Some(vec![6; 33]),
+            ..Verified::default()
+        };
+        let expected_verified = existing.verified.clone();
+
+        let merged = merge_profile_contact(
+            Uuid::from_u128(1),
+            Some(existing),
+            Some(&old_profile),
+            &new_profile,
+            new_profile_key,
+            30,
+            4,
+        );
+
+        assert_eq!(merged.name, "Address Book");
+        assert_eq!(merged.phone_number, Some(phone_number));
+        assert_eq!(merged.profile_key, new_profile_key.bytes);
+        assert_eq!(merged.expire_timer, 60);
+        assert_eq!(merged.expire_timer_version, 6);
+        assert_eq!(merged.inbox_position, 12);
+        assert_eq!(merged.verified, expected_verified);
+        let avatar = merged.avatar.unwrap();
+        assert_eq!(avatar.content_type, "image/png");
+        assert_eq!(avatar.reader, bytes::Bytes::from_static(b"avatar"));
+    }
+
+    #[test]
+    fn profile_contact_upsert_detects_empty_names_and_key_drift() {
+        let profile_key = ProfileKey::create([7; 32]);
+        let other_profile_key = ProfileKey::create([8; 32]);
+        let complete = contact("Profile", profile_key.bytes.to_vec());
+        let empty = contact("", profile_key.bytes.to_vec());
+        let stale_duplicate = contact("Profile", other_profile_key.bytes.to_vec());
+
+        assert!(needs_profile_contact_upsert(
+            None,
+            Some(&profile_key),
+            &profile_key
+        ));
+        assert!(needs_profile_contact_upsert(
+            Some(&empty),
+            Some(&profile_key),
+            &profile_key
+        ));
+        assert!(needs_profile_contact_upsert(
+            Some(&stale_duplicate),
+            Some(&profile_key),
+            &profile_key
+        ));
+        assert!(needs_profile_contact_upsert(
+            Some(&complete),
+            None,
+            &profile_key
+        ));
+        assert!(needs_profile_contact_upsert(
+            Some(&complete),
+            Some(&other_profile_key),
+            &profile_key
+        ));
+        assert!(!needs_profile_contact_upsert(
+            Some(&complete),
+            Some(&profile_key),
+            &profile_key
+        ));
+    }
+
+    #[test]
+    fn profile_contact_creation_uses_profile_name_and_message_timer() {
+        let profile = profile(Some(("New", Some("Contact"))));
+        let profile_key = ProfileKey::create([7; 32]);
+
+        let merged =
+            merge_profile_contact(Uuid::from_u128(1), None, None, &profile, profile_key, 30, 4);
+
+        assert_eq!(merged.name, "New Contact");
+        assert_eq!(merged.profile_key, profile_key.bytes);
+        assert_eq!(merged.expire_timer, 30);
+        assert_eq!(merged.expire_timer_version, 4);
+    }
+
+    fn service_group(members: &[Aci]) -> ServiceGroup {
+        ServiceGroup {
+            title: "test group".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            version: 4,
+            members: members
+                .iter()
+                .copied()
+                .map(|aci| ServiceMember {
+                    aci,
+                    role: Role::Default,
+                    profile_key: ProfileKey::create([3; 32]),
+                    joined_at_version: 1,
+                    label: None,
+                    label_emoji: None,
+                })
+                .collect(),
+            members_pending_profile_key: Vec::new(),
+            members_pending_admin_approval: Vec::new(),
+            invite_link_password: Vec::new(),
+            description_text: None,
+            announcements_only: false,
+            members_banned: Vec::new(),
+            terminated: false,
+        }
+    }
+
+    fn timestamp_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(SIGNAL_TIMESTAMP_HEADER),
+            HeaderValue::from_static("123456789"),
+        );
+        headers
+    }
+
+    fn storage_group_record(value: u8) -> StorageRecord {
+        StorageRecord {
+            record: Some(storage_record::Record::GroupV2(GroupV2Record {
+                master_key: vec![value; 32],
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn selects_only_group_v2_storage_items() {
+        let manifest = ManifestRecord {
+            identifiers: vec![
+                Identifier {
+                    raw: vec![1],
+                    r#type: Type::Contact as i32,
+                },
+                Identifier {
+                    raw: vec![2],
+                    r#type: Type::Groupv2 as i32,
+                },
+                Identifier {
+                    raw: vec![3],
+                    r#type: Type::Groupv1 as i32,
+                },
+            ],
+            ..ManifestRecord::default()
+        };
+
+        assert_eq!(storage_group_item_keys(&manifest).unwrap(), vec![vec![2]]);
+    }
+
+    #[test]
+    fn rejects_duplicate_group_keys_in_manifest() {
+        let manifest = ManifestRecord {
+            identifiers: vec![
+                Identifier {
+                    raw: vec![2],
+                    r#type: Type::Groupv2 as i32,
+                },
+                Identifier {
+                    raw: vec![2],
+                    r#type: Type::Groupv2 as i32,
+                },
+            ],
+            ..ManifestRecord::default()
+        };
+
+        assert_eq!(
+            storage_group_item_keys(&manifest),
+            Err(StorageGroupSnapshotError::DuplicateManifestKey)
+        );
+    }
+
+    #[test]
+    fn accepts_reordered_exact_storage_response_keys() {
+        let requested = vec![vec![1], vec![2]];
+        let records = match_storage_group_records(
+            &requested,
+            vec![
+                (vec![2], storage_group_record(2)),
+                (vec![1], storage_group_record(1)),
+            ],
+        )
+        .unwrap();
+
+        let master_keys = records
+            .into_iter()
+            .map(|record| match record.record.unwrap() {
+                storage_record::Record::GroupV2(group) => group.master_key,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(master_keys, vec![vec![1; 32], vec![2; 32]]);
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unrequested_storage_response_keys() {
+        let requested = vec![vec![1], vec![2]];
+
+        assert_eq!(
+            match_storage_group_records(&requested, vec![(vec![1], storage_group_record(1))]),
+            Err(StorageGroupSnapshotError::ResponseKeySetMismatch)
+        );
+        assert_eq!(
+            match_storage_group_records(
+                &requested,
+                vec![
+                    (vec![1], storage_group_record(1)),
+                    (vec![2], storage_group_record(2)),
+                    (vec![3], storage_group_record(3)),
+                ]
+            ),
+            Err(StorageGroupSnapshotError::ResponseKeySetMismatch)
+        );
+        assert_eq!(
+            match_storage_group_records(
+                &requested,
+                vec![
+                    (vec![1], storage_group_record(1)),
+                    (vec![1], storage_group_record(1)),
+                ]
+            ),
+            Err(StorageGroupSnapshotError::ResponseKeySetMismatch)
+        );
+    }
+
+    #[test]
+    fn filters_snapshots_to_active_self_membership() {
+        let own = aci(1);
+        assert!(group_has_member(&service_group(&[own, aci(2)]), own));
+        assert!(!group_has_member(&service_group(&[aci(2)]), own));
+        assert!(!group_has_member(&service_group(&[]), own));
+    }
+
+    #[test]
+    fn confirms_leave_when_authoritative_group_is_inaccessible() {
+        let own = aci(1);
+
+        assert!(confirmed_group_after_leave(None, own).unwrap().is_none());
+    }
+
+    #[test]
+    fn confirms_leave_from_authoritative_nonmembership() {
+        let own = aci(1);
+        let other = aci(2);
+        let confirmed = confirmed_group_after_leave(Some(service_group(&[other])), own)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(confirmed.members.len(), 1);
+        assert_eq!(confirmed.members[0].aci, other);
+    }
+
+    #[test]
+    fn rejects_leave_confirmation_while_account_is_still_a_member() {
+        let own = aci(1);
+
+        assert!(matches!(
+            confirmed_group_after_leave(Some(service_group(&[own])), own),
+            Err(GroupLeaveConfirmationError::StillMember)
+        ));
+    }
+
+    #[test]
+    fn identifies_only_stale_stored_group_keys() {
+        let active = HashSet::from([[1; 32], [3; 32]]);
+        assert_eq!(
+            stale_group_keys([[1; 32], [2; 32], [3; 32]], &active),
+            vec![[2; 32]]
+        );
+    }
+
+    #[test]
+    fn keeps_cached_manifest_absent_group_when_still_active() {
+        let manifest_key = [1; 32];
+        let cached_key = [2; 32];
+        let candidates = group_candidate_keys([manifest_key], [cached_key]);
+        assert_eq!(candidates, HashSet::from([manifest_key, cached_key]));
+
+        let own = aci(1);
+        let active = active_group_from_snapshot(cached_key, service_group(&[own]), own).unwrap();
+        let active_keys = HashSet::from([active.0]);
+        assert!(stale_group_keys([cached_key], &active_keys).is_empty());
+    }
+
+    #[test]
+    fn prunes_cached_manifest_absent_group_after_authoritative_nonmembership() {
+        let cached_key = [2; 32];
+        let candidates = group_candidate_keys([], [cached_key]);
+        assert_eq!(candidates, HashSet::from([cached_key]));
+
+        let own = aci(1);
+        assert!(active_group_from_snapshot(cached_key, service_group(&[aci(2)]), own).is_none());
+        assert_eq!(
+            stale_group_keys([cached_key], &HashSet::new()),
+            vec![cached_key]
+        );
+    }
+
+    #[test]
+    fn builds_and_decodes_a_leave_change() {
+        assert_eq!(GROUPS_V2_ENDPOINT, "/v2/groups/");
+        let master_key = [9; 32];
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        let operations = GroupOperations::new(secret_params);
+        let own = aci(1);
+        let own_uuid: Uuid = own.into();
+        let request = build_leave_group_actions(&operations, own, 8).unwrap();
+
+        assert_eq!(request.source_user_id.len(), 16);
+        assert_eq!(request.source_user_id, own_uuid.as_bytes());
+        assert!(request.group_id.is_empty());
+        assert_eq!(request.version, 8);
+        assert_eq!(request.delete_members.len(), 1);
+
+        // The service binds the response to the group and encrypts the editor
+        // before signing it. Recreate that response shape for decoder coverage.
+        let mut response_actions = request;
+        response_actions.group_id = secret_params.get_group_identifier().to_vec();
+        response_actions.source_user_id =
+            response_actions.delete_members[0].deleted_user_id.clone();
+        let response = ProtoGroupChange {
+            actions: response_actions.encode_to_vec(),
+            server_signature: vec![0; 64],
+            change_epoch: 0,
+        };
+        let decoded = operations.decrypt_group_change(response).unwrap();
+        assert!(is_expected_leave_change(
+            &decoded,
+            secret_params.get_group_identifier(),
+            own,
+            8
+        ));
+        assert!(!is_expected_leave_change(
+            &decoded,
+            secret_params.get_group_identifier(),
+            own,
+            9
+        ));
+    }
+
+    #[test]
+    fn reads_signal_group_change_timestamp() {
+        let mut headers = timestamp_headers();
+        assert_eq!(signal_response_timestamp(&headers), Some(123_456_789));
+
+        headers.insert(
+            HeaderName::from_static(SIGNAL_TIMESTAMP_HEADER),
+            HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(signal_response_timestamp(&headers), None);
+    }
+
+    #[test]
+    fn classifies_authoritative_group_responses() {
+        let headers = timestamp_headers();
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::OK, &headers).unwrap(),
+            AuthoritativeGroupResponse::Current
+        );
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::FORBIDDEN, &headers).unwrap(),
+            AuthoritativeGroupResponse::Inactive
+        );
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::NOT_FOUND, &headers).unwrap(),
+            AuthoritativeGroupResponse::Inactive
+        );
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::UNAUTHORIZED, &headers).unwrap(),
+            AuthoritativeGroupResponse::Error
+        );
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::LOCKED, &headers).unwrap(),
+            AuthoritativeGroupResponse::Error
+        );
+        assert_eq!(
+            classify_authoritative_group_response(StatusCode::INTERNAL_SERVER_ERROR, &headers)
+                .unwrap(),
+            AuthoritativeGroupResponse::Error
+        );
+    }
+
+    #[test]
+    fn rejects_departure_without_a_valid_timestamp() {
+        assert!(matches!(
+            classify_authoritative_group_response(StatusCode::FORBIDDEN, &HeaderMap::new()),
+            Err(ServiceError::InvalidFrame { .. })
+        ));
+        assert!(matches!(
+            classify_authoritative_group_response(StatusCode::NOT_FOUND, &HeaderMap::new()),
+            Err(ServiceError::InvalidFrame { .. })
+        ));
+
+        let mut headers = timestamp_headers();
+        headers.insert(
+            HeaderName::from_static(SIGNAL_TIMESTAMP_HEADER),
+            HeaderValue::from_static("invalid"),
+        );
+        assert!(matches!(
+            classify_authoritative_group_response(StatusCode::FORBIDDEN, &headers),
+            Err(ServiceError::InvalidFrame { .. })
+        ));
+    }
+
+    #[test]
+    fn requires_a_group_in_the_current_state_response() {
+        assert!(matches!(
+            group_from_response(GroupResponse::default()),
+            Err(ServiceError::GroupsV2Error)
+        ));
+        assert!(group_from_response(GroupResponse {
+            group: Some(libsignal_service::proto::Group::default()),
+            ..Default::default()
+        })
+        .is_ok());
+    }
 }

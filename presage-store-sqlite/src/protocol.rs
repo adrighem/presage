@@ -41,6 +41,13 @@ impl IdentityType {
             Self::Pni => "identity_keypair_pni",
         }
     }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Aci => "aci",
+            Self::Pni => "pni",
+        }
+    }
 }
 
 impl ProtocolStore for SqliteProtocolStore {}
@@ -630,8 +637,20 @@ impl IdentityKeyStore for SqliteProtocolStore {
         &self,
         address: &ProtocolAddress,
         identity: &IdentityKey,
-        _direction: Direction,
+        direction: Direction,
     ) -> Result<bool, SignalProtocolError> {
+        if matches!(
+            self.store.trust_new_identities,
+            OnNewIdentity::TrustUnverified
+        ) && matches!(direction, Direction::Sending)
+            && self
+                .store
+                .has_blocking_identity_change(address.name(), self.identity)
+                .await?
+        {
+            return Ok(false);
+        }
+
         if let Some(trusted_key) = self.get_identity(address).await? {
             // when we encounter some identity we know, we need to decide whether we trust it or not
             if identity == &trusted_key {
@@ -640,6 +659,18 @@ impl IdentityKeyStore for SqliteProtocolStore {
                 match self.store.trust_new_identities {
                     OnNewIdentity::Trust => Ok(true),
                     OnNewIdentity::Reject => Ok(false),
+                    OnNewIdentity::TrustUnverified => {
+                        let verified = self.store.contact_is_verified(address.name()).await?;
+                        self.store
+                            .record_identity_change(
+                                address.name(),
+                                self.identity,
+                                identity,
+                                verified,
+                            )
+                            .await?;
+                        Ok(matches!(direction, Direction::Receiving) || !verified)
+                    }
                 }
             }
         } else {
@@ -724,9 +755,127 @@ impl SenderKeyStore for SqliteProtocolStore {
 
 #[cfg(test)]
 mod test {
-    use presage::libsignal_service::protocol::{KeyPair, KyberPreKeyStore, Timestamp};
+    use presage::{
+        libsignal_service::{
+            proto::{Verified, verified},
+            protocol::{
+                DeviceId, Direction, IdentityKey, IdentityKeyStore, KeyPair, KyberPreKeyStore,
+                ProtocolAddress, Timestamp,
+            },
+        },
+        model::contacts::Contact,
+        store::ContentsStore,
+    };
 
     use super::*;
+
+    #[tokio::test]
+    async fn blocks_verified_identity_changes_until_acceptance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::TrustUnverified).await?;
+        sqlite_store.initialize_identity_change_tracking().await?;
+        let contact_uuid = Uuid::parse_str("00000000-0000-0000-0000-000000000001")?;
+        let address = contact_uuid.to_string();
+        let protocol_address = ProtocolAddress::new(address.clone(), DeviceId::new(1)?);
+        let first = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
+        let replacement = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
+        let mut contact_store = sqlite_store.clone();
+        contact_store
+            .save_contact(&Contact {
+                uuid: contact_uuid,
+                phone_number: None,
+                name: "Test Contact".into(),
+                verified: Verified {
+                    destination_aci: Some(address.clone()),
+                    destination_aci_binary: None,
+                    identity_key: Some(first.serialize().to_vec()),
+                    state: Some(verified::State::Verified.into()),
+                    null_message: None,
+                },
+                profile_key: Vec::new(),
+                expire_timer: 0,
+                expire_timer_version: 2,
+                inbox_position: 0,
+                avatar: None,
+            })
+            .await?;
+        let mut protocol_store = SqliteProtocolStore {
+            store: sqlite_store.clone(),
+            identity: IdentityType::Aci,
+        };
+        protocol_store
+            .save_identity(&protocol_address, &first)
+            .await?;
+
+        assert!(
+            !protocol_store
+                .is_trusted_identity(&protocol_address, &replacement, Direction::Sending)
+                .await?
+        );
+        assert!(
+            protocol_store
+                .is_trusted_identity(&protocol_address, &replacement, Direction::Receiving)
+                .await?
+        );
+        protocol_store
+            .save_identity(&protocol_address, &replacement)
+            .await?;
+        assert!(
+            !protocol_store
+                .is_trusted_identity(&protocol_address, &replacement, Direction::Sending)
+                .await?
+        );
+        assert_eq!(
+            sqlite_store.identity_change_notices().await?,
+            vec![crate::IdentityChangeNotice {
+                address: address.clone(),
+                verified: true,
+            }]
+        );
+
+        assert!(sqlite_store.accept_identity_change(&address).await?);
+        assert!(
+            protocol_store
+                .is_trusted_identity(&protocol_address, &replacement, Direction::Sending)
+                .await?
+        );
+        assert!(sqlite_store.identity_change_notices().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trusts_unverified_identity_changes_with_dismissible_notice()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::TrustUnverified).await?;
+        sqlite_store.initialize_identity_change_tracking().await?;
+        let address = "00000000-0000-0000-0000-000000000002".to_owned();
+        let protocol_address = ProtocolAddress::new(address.clone(), DeviceId::new(1)?);
+        let first = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
+        let replacement = IdentityKey::new(KeyPair::generate(&mut rand::rng()).public_key);
+        let mut protocol_store = SqliteProtocolStore {
+            store: sqlite_store.clone(),
+            identity: IdentityType::Aci,
+        };
+        protocol_store
+            .save_identity(&protocol_address, &first)
+            .await?;
+
+        assert!(
+            protocol_store
+                .is_trusted_identity(&protocol_address, &replacement, Direction::Sending)
+                .await?
+        );
+        assert_eq!(
+            sqlite_store.identity_change_notices().await?,
+            vec![crate::IdentityChangeNotice {
+                address: address.clone(),
+                verified: false,
+            }]
+        );
+        sqlite_store.dismiss_identity_change(&address).await?;
+        assert!(sqlite_store.identity_change_notices().await?.is_empty());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn kyber_pre_keys_mark_used_one_time() -> Result<(), Box<dyn std::error::Error>> {
