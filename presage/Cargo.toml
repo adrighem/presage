@@ -12,7 +12,7 @@ default = []
 cdsi = ["libsignal-service/cdsi"]
 
 [dependencies]
-libsignal-service = { git = "https://github.com/adrighem/libsignal-service-rs", rev = "b8d3846154f690327dc6db34fcd2f387a8be137b", default-features = false, features = [
+libsignal-service = { git = "https://github.com/adrighem/libsignal-service-rs", branch = "main", default-features = false, features = [
     "phonenumber",
 ] }
 
