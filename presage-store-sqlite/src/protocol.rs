@@ -288,11 +288,12 @@ impl PreKeysStore for SqliteProtocolStore {
     }
 
     /// number of kyber pre-keys we currently have in store
-    async fn kyber_pre_keys_count(&self, _last_resort: bool) -> Result<usize, SignalProtocolError> {
-        query_scalar!(
-            "SELECT COUNT(id) FROM kyber_pre_keys WHERE identity = ?",
-            self.identity
+    async fn kyber_pre_keys_count(&self, last_resort: bool) -> Result<usize, SignalProtocolError> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(id) FROM kyber_pre_keys WHERE identity = ? AND is_last_resort = ?",
         )
+        .bind(self.identity)
+        .bind(last_resort)
         .fetch_one(&self.store.db)
         .await
         .into_protocol_error()

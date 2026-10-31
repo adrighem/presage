@@ -94,6 +94,7 @@ const ATTACHMENT_IV_SIZE: u128 = 16;
 const ATTACHMENT_MAC_SIZE: u128 = 32;
 const ATTACHMENT_MIN_CIPHERTEXT_SIZE: usize = 64;
 const CONTACT_PROFILE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const PRE_KEY_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProfileUpdateObservation {
@@ -1318,6 +1319,7 @@ impl<S: Store> Manager<S, Registered> {
             contact_updates: ContactUpdateCoordinator,
             profile_workers: ContactProfileWorkerQueue,
             queue_empty_pending: bool,
+            initial_queue_drained: bool,
             identified_websocket: SignalWebSocket<websocket::Identified>,
             unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
             encrypted_messages: Receiver,
@@ -1330,6 +1332,9 @@ impl<S: Store> Manager<S, Registered> {
             message_sender: MessageSender<AciStore>,
             account_entropy_pool: Option<AccountEntropyPool>,
             registration_type: RegistrationType,
+            account_manager: AccountManager,
+            pre_keys_dirty: bool,
+            last_pre_key_refresh: Option<std::time::Instant>,
         }
 
         let identified_push_service = self.identified_push_service();
@@ -1358,10 +1363,6 @@ impl<S: Store> Manager<S, Registered> {
                 error!(%error, "failed to set account attributes, this is problematic and should never happen!");
             }
 
-            if let Err(error) = register_pre_keys(&store_inner, &mut account_manager).await {
-                error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
-            }
-
             // Never return, which keeps the messages stream alive.
             future::pending::<()>().await
         };
@@ -1373,18 +1374,26 @@ impl<S: Store> Manager<S, Registered> {
             contact_updates: self.state.contact_updates.clone(),
             profile_workers: ContactProfileWorkerQueue::default(),
             queue_empty_pending: false,
-            identified_websocket,
+            initial_queue_drained: false,
+            identified_websocket: identified_websocket.clone(),
             unidentified_websocket: self.unidentified_websocket().await?,
             encrypted_messages: Box::pin(encrypted_messages.stream()),
             message_receiver: MessageReceiver::new(identified_push_service.clone()),
             service_cipher_aci: self.new_service_cipher_aci(),
             service_cipher_pni: self.new_service_cipher_pni(),
             groups_manager: Box::pin(self.groups_manager()).await?,
-            identified_push_service,
+            identified_push_service: identified_push_service.clone(),
             service_ids: self.state.data.service_ids.clone(),
             message_sender: self.new_message_sender().await?,
             account_entropy_pool: self.account_entropy_pool().await?,
             registration_type: self.registration_type(),
+            account_manager: AccountManager::new(
+                identified_push_service.clone(),
+                identified_websocket.clone(),
+                None,
+            ),
+            pre_keys_dirty: true,
+            last_pre_key_refresh: None,
         };
 
         debug!("starting to consume incoming message stream");
@@ -1394,6 +1403,17 @@ impl<S: Store> Manager<S, Registered> {
                 loop {
                     if state.queue_empty_pending && state.profile_workers.is_empty() {
                         state.queue_empty_pending = false;
+                        state.initial_queue_drained = true;
+                        if state.pre_keys_dirty {
+                            if let Err(error) =
+                                register_pre_keys(&state.store, &mut state.account_manager).await
+                            {
+                                warn!(%error, "failed to refresh pre-keys on QueueEmpty");
+                            } else {
+                                state.pre_keys_dirty = false;
+                                state.last_pre_key_refresh = Some(std::time::Instant::now());
+                            }
+                        }
                         return Some((Received::QueueEmpty, state));
                     }
 
@@ -1424,6 +1444,14 @@ impl<S: Store> Manager<S, Registered> {
                     };
                     match incoming {
                         Some(Ok(Incoming::Envelope(envelope))) => {
+                            if matches!(
+                                envelope.r#type(),
+                                libsignal_service::proto::envelope::Type::PrekeyMessage
+                                    | libsignal_service::proto::envelope::Type::UnidentifiedSender
+                            ) {
+                                state.pre_keys_dirty = true;
+                            }
+
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
                                 match envelope.parse_destination_service_id() {
@@ -1451,6 +1479,25 @@ impl<S: Store> Manager<S, Registered> {
                                     }
                                 }
                             };
+
+                            if state.initial_queue_drained
+                                && !state.queue_empty_pending
+                                && state.pre_keys_dirty
+                                && state
+                                    .last_pre_key_refresh
+                                    .map_or(true, |t| t.elapsed() >= PRE_KEY_REFRESH_MIN_INTERVAL)
+                            {
+                                if let Err(error) =
+                                    register_pre_keys(&state.store, &mut state.account_manager)
+                                        .await
+                                {
+                                    warn!(%error, "failed to refresh pre-keys after pre-key message");
+                                } else {
+                                    state.pre_keys_dirty = false;
+                                    state.last_pre_key_refresh = Some(std::time::Instant::now());
+                                }
+                            }
+
                             match envelope {
                                 Ok(Some(content)) => {
                                     if let ContentBody::DecryptionErrorMessage(e) = &content.body {
@@ -1805,6 +1852,20 @@ impl<S: Store> Manager<S, Registered> {
                                 state.queue_empty_pending = true;
                                 continue;
                             }
+
+                            state.initial_queue_drained = true;
+                            if state.pre_keys_dirty {
+                                if let Err(error) =
+                                    register_pre_keys(&state.store, &mut state.account_manager)
+                                        .await
+                                {
+                                    warn!(%error, "failed to refresh pre-keys on QueueEmpty");
+                                } else {
+                                    state.pre_keys_dirty = false;
+                                    state.last_pre_key_refresh = Some(std::time::Instant::now());
+                                }
+                            }
+
                             return Some((Received::QueueEmpty, state));
                         }
                         Some(Err(error)) => {
@@ -4308,5 +4369,49 @@ mod tests {
             ..Default::default()
         })
         .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod pre_key_refresh_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn test_pre_key_refresh_gating() {
+        let mut pre_keys_dirty = true;
+        let mut last_pre_key_refresh: Option<Instant> = None;
+        let queue_empty_pending = false;
+        let mut initial_queue_drained = false;
+
+        // Before initial QueueEmpty, backlog messages must not trigger live refresh
+        let should_refresh = initial_queue_drained
+            && !queue_empty_pending
+            && pre_keys_dirty
+            && last_pre_key_refresh.map_or(true, |t| t.elapsed() >= PRE_KEY_REFRESH_MIN_INTERVAL);
+        assert!(!should_refresh);
+
+        // QueueEmpty arrives and refreshes pre-keys
+        initial_queue_drained = true;
+        pre_keys_dirty = false;
+        last_pre_key_refresh = Some(Instant::now());
+
+        // Now we receive another PreKeyBundle immediately after QueueEmpty
+        pre_keys_dirty = true;
+
+        // It should NOT refresh immediately because of the throttle
+        let should_refresh = initial_queue_drained
+            && !queue_empty_pending
+            && pre_keys_dirty
+            && last_pre_key_refresh.map_or(true, |t| t.elapsed() >= PRE_KEY_REFRESH_MIN_INTERVAL);
+        assert!(!should_refresh);
+
+        // After the throttle interval elapses, live PreKeyBundle refreshes
+        last_pre_key_refresh = Some(Instant::now() - PRE_KEY_REFRESH_MIN_INTERVAL);
+        let should_refresh = initial_queue_drained
+            && !queue_empty_pending
+            && pre_keys_dirty
+            && last_pre_key_refresh.map_or(true, |t| t.elapsed() >= PRE_KEY_REFRESH_MIN_INTERVAL);
+        assert!(should_refresh);
     }
 }
