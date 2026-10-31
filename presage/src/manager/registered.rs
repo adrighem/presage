@@ -30,7 +30,7 @@ use libsignal_service::{
     proto::{
         data_message::Delete,
         group_change,
-        manifest_record::identifier,
+        manifest_record::{self, identifier},
         storage_record,
         sync_message::{
             self, sticker_pack_operation, Content as SyncContent, StickerPackOperation,
@@ -51,6 +51,7 @@ use libsignal_service::{
     websocket::{
         self,
         account::{AccountAttributes, DeviceCapabilities, DeviceInfo, WhoAmIResponse},
+        calling::TurnServer,
         SignalWebSocket,
     },
     zkgroup::{
@@ -72,6 +73,7 @@ use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 use crate::model::contacts::Contact;
+use crate::model::previews;
 use crate::serde::serde_profile_key;
 use crate::store::{
     ContentExt, ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread,
@@ -465,6 +467,7 @@ pub struct Registered {
     pub(crate) unidentified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Unidentified>>>>,
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
     contact_updates: ContactUpdateCoordinator,
+    pub(crate) link_preview_client: OnceLock<reqwest::Client>,
 
     pub(crate) data: Arc<RegistrationData>,
 }
@@ -484,6 +487,7 @@ impl Registered {
             unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
             contact_updates: Default::default(),
+            link_preview_client: Default::default(),
             data: Arc::new(data),
         }
     }
@@ -539,6 +543,9 @@ pub struct RegistrationData {
     pub pni_registration_id: Option<u32>,
     #[serde(with = "serde_profile_key")]
     pub(crate) profile_key: ProfileKey,
+    /// Decrypts the link-time message history archive. Single-use, so not persisted.
+    #[serde(skip)]
+    pub(crate) ephemeral_backup_key: Option<[u8; 32]>,
 }
 
 impl RegistrationData {
@@ -550,6 +557,12 @@ impl RegistrationData {
     /// The name of the device (if linked as secondary)
     pub fn device_name(&self) -> Option<&str> {
         self.device_name.as_deref()
+    }
+
+    /// Set right after [`Manager::link_secondary_device`][crate::Manager::link_secondary_device]
+    /// if the primary device offered to transfer message history.
+    pub fn ephemeral_backup_key(&self) -> Option<[u8; 32]> {
+        self.ephemeral_backup_key
     }
 }
 
@@ -1280,6 +1293,16 @@ impl<S: Store> Manager<S, Registered> {
         }
     }
 
+    /// See [`sync_groups_from_storage_service`].
+    pub(super) async fn sync_groups_from_storage_service(&self) -> Result<(), Error<S::Error>> {
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        sync_groups_from_storage_service(
+            &self.store,
+            self.identified_push_service(),
+            &mut groups_manager,
+        )
+        .await
+    }
     /// Starts receiving and storing messages.
     ///
     /// As a client, it is heavily recommended to process incoming messages and wait for the `Received::QueueEmpty` messages
@@ -1289,7 +1312,7 @@ impl<S: Store> Manager<S, Registered> {
     /// Returns a [futures::Stream] of messages to consume. Messages will also be stored by the implementation of the [Store].
     pub async fn receive_messages(
         &mut self,
-    ) -> Result<impl Stream<Item = Received>, Error<S::Error>> {
+    ) -> Result<impl Stream<Item = Received> + use<S>, Error<S::Error>> {
         struct StreamState<Receiver, Store, AciStore, PniStore> {
             store: Store,
             contact_updates: ContactUpdateCoordinator,
@@ -1302,6 +1325,7 @@ impl<S: Store> Manager<S, Registered> {
             service_cipher_aci: ServiceCipher<AciStore>,
             service_cipher_pni: ServiceCipher<PniStore>,
             groups_manager: GroupsManager<InMemoryCredentialsCache>,
+            identified_push_service: PushService,
             service_ids: ServiceIds,
             message_sender: MessageSender<AciStore>,
             account_entropy_pool: Option<AccountEntropyPool>,
@@ -1352,10 +1376,11 @@ impl<S: Store> Manager<S, Registered> {
             identified_websocket,
             unidentified_websocket: self.unidentified_websocket().await?,
             encrypted_messages: Box::pin(encrypted_messages.stream()),
-            message_receiver: MessageReceiver::new(identified_push_service),
+            message_receiver: MessageReceiver::new(identified_push_service.clone()),
             service_cipher_aci: self.new_service_cipher_aci(),
             service_cipher_pni: self.new_service_cipher_pni(),
             groups_manager: Box::pin(self.groups_manager()).await?,
+            identified_push_service,
             service_ids: self.state.data.service_ids.clone(),
             message_sender: self.new_message_sender().await?,
             account_entropy_pool: self.account_entropy_pool().await?,
@@ -1402,7 +1427,11 @@ impl<S: Store> Manager<S, Registered> {
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
                                 match envelope.parse_destination_service_id() {
-                                    None | Some(ServiceId::Aci(_)) => {
+                                    None => {
+                                        warn!("Message has no destination service ID, dropping.");
+                                        continue;
+                                    }
+                                    Some(ServiceId::Aci(_)) => {
                                         state
                                             .service_cipher_aci
                                             .open_envelope(envelope, &mut rand::rng())
@@ -1410,7 +1439,7 @@ impl<S: Store> Manager<S, Registered> {
                                     }
                                     Some(ServiceId::Pni(pni)) => {
                                         if pni == state.service_ids.pni()
-                                            && envelope.source_service_id.is_none()
+                                            && envelope.parse_source_service_id().is_none()
                                         {
                                             warn!("Got a sealed sender message to our PNI? Invalid message, ignoring.");
                                             continue;
@@ -1655,6 +1684,27 @@ impl<S: Store> Manager<S, Registered> {
                                         }
                                     }
 
+                                    // The primary device told us to fetch stuff again from the storage service.
+                                    if let ContentBody::SynchronizeMessage(SyncMessage {
+                                        content: Some(SyncContent::FetchLatest(fetch_latest)),
+                                        ..
+                                    }) = &content.body
+                                    {
+                                        if fetch_latest.r#type()
+                                            == sync_message::fetch_latest::Type::StorageManifest
+                                        {
+                                            if let Err(error) = sync_groups_from_storage_service(
+                                                &state.store,
+                                                state.identified_push_service.clone(),
+                                                &mut state.groups_manager,
+                                            )
+                                            .await
+                                            {
+                                                warn!(%error, "failed to sync groups from the storage service");
+                                            }
+                                        }
+                                    }
+
                                     // group update
                                     if let ContentBody::DataMessage(DataMessage {
                                         group_v2:
@@ -1839,6 +1889,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut content_body: ContentBody = message.into();
 
         self.restore_thread_timer(&thread, &mut content_body).await;
+        self.fetch_link_previews(&mut content_body).await;
 
         let sender_certificate = self.sender_certificate().await?;
         let unidentified_access = self
@@ -1903,6 +1954,72 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// Fetches a preview (title, description, image) for the first link in `body`, and
+    /// uploads its image as an attachment, ready to be set as the `preview` of the
+    /// `DataMessage` sending `body`.
+    ///
+    /// Returns `None` if `body` has no link to preview.
+    ///
+    /// This fetches the linked page, which reveals the user's IP address to its server.
+    pub async fn link_preview(
+        &self,
+        body: &str,
+    ) -> Result<Option<libsignal_service::proto::Preview>, Error<S::Error>> {
+        let client = match self.state.link_preview_client.get() {
+            Some(client) => client,
+            None => {
+                let client = previews::client_builder()
+                    .build()
+                    .map_err(previews::Error::from)?;
+                self.state.link_preview_client.get_or_init(|| client)
+            }
+        };
+        let Some(content) = previews::generate_preview_from_message(body, client).await? else {
+            return Ok(None);
+        };
+
+        // the preview is still useful without its image
+        let image = match previews::build_preview_image(&content) {
+            Some((spec, bytes)) => match self.upload_attachment(spec, bytes).await {
+                Ok(Ok(pointer)) => Some(pointer),
+                Ok(Err(error)) => {
+                    warn!(%error, "failed to upload link preview image");
+                    None
+                }
+                Err(error) => {
+                    warn!(%error, "failed to upload link preview image");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        Ok(Some(libsignal_service::proto::Preview {
+            url: content.url,
+            title: content.title,
+            image,
+            description: content.description,
+            date: content.date,
+        }))
+    }
+
+    /// Sets a preview of the first link of a data message that has no preview yet.
+    async fn fetch_link_previews(&self, content_body: &mut ContentBody) {
+        let ContentBody::DataMessage(message) = content_body else {
+            return;
+        };
+        if !message.preview.is_empty() {
+            return;
+        }
+        let Some(body) = message.body.as_deref() else {
+            return;
+        };
+        match self.link_preview(body).await {
+            Ok(preview) => message.preview.extend(preview),
+            Err(error) => warn!(%error, "failed to build link preview, sending without"),
+        }
+    }
+
     /// Uploads one attachment prior to linking them in a message.
     pub async fn upload_attachment(
         &self,
@@ -1949,6 +2066,7 @@ impl<S: Store> Manager<S, Registered> {
         let thread = Thread::Group(master_key_bytes);
 
         self.restore_thread_timer(&thread, &mut content_body).await;
+        self.fetch_link_previews(&mut content_body).await;
         ensure_data_message_timestamp(&mut content_body, timestamp);
 
         let mut sender = self.new_message_sender().await?;
@@ -2038,8 +2156,8 @@ impl<S: Store> Manager<S, Registered> {
         let store_expire_timer = self.store.expire_timer(thread).await.unwrap_or_default();
 
         if let ContentBody::DataMessage(DataMessage {
-            expire_timer: ref mut timer,
-            expire_timer_version: ref mut version,
+            expire_timer: timer,
+            expire_timer_version: version,
             ..
         }) = content_body
         {
@@ -2284,6 +2402,65 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// Records a finished call in the thread with the peer of `event` and tells our other
+    /// devices about it, so their call logs agree. Returns the stored content.
+    pub async fn send_call_event(
+        &mut self,
+        event: sync_message::CallEvent,
+    ) -> Result<Content, Error<S::Error>> {
+        let sync_message = SyncMessage {
+            content: Some(SyncContent::CallEvent(event.clone())),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        self.new_message_sender()
+            .await?
+            .send_sync_message(sync_message.clone())
+            .await?;
+
+        let aci = self.state.data.service_ids.aci();
+        // Filed under the start of the call.
+        let timestamp = event
+            .timestamp
+            .and_then(|ts| chrono::Utc.timestamp_millis_opt(ts as i64).single())
+            .unwrap_or_else(chrono::Utc::now);
+        let content = Content {
+            metadata: Metadata {
+                sender: aci.into(),
+                sender_device: self.state.device_id(),
+                destination: aci.into(),
+                server_guid: None,
+                client_timestamp: timestamp,
+                server_timestamp: timestamp,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                pni_verified: None,
+            },
+            body: ContentBody::SynchronizeMessage(sync_message),
+        };
+
+        let mut identified_websocket = self.identified_websocket(false).await?;
+        save_message(
+            &mut self.store,
+            &mut identified_websocket,
+            &self.state.contact_updates,
+            None,
+            content.clone(),
+            None,
+        )
+        .await?;
+        Ok(content)
+    }
+
+    /// Fetches short-lived TURN credentials for 1:1 calls.
+    pub async fn calling_relays(&self) -> Result<Vec<TurnServer>, Error<S::Error>> {
+        Ok(self
+            .identified_websocket(false)
+            .await?
+            .get_calling_relays()
+            .await?)
+    }
+
     fn credentials(&self) -> ServiceCredentials {
         self.state.credentials()
     }
@@ -2322,7 +2499,7 @@ impl<S: Store> Manager<S, Registered> {
                 .service_configuration()
                 .unidentified_sender_trust_roots,
             ProtocolAddress::new(
-                self.state.data.service_ids.aci.to_string(),
+                self.state.data.service_ids.aci().service_id_string(),
                 self.state.device_id(),
             ),
         )
@@ -2335,7 +2512,7 @@ impl<S: Store> Manager<S, Registered> {
                 .service_configuration()
                 .unidentified_sender_trust_roots,
             ProtocolAddress::new(
-                self.state.data.service_ids.pni.to_string(),
+                self.state.data.service_ids.pni().service_id_string(),
                 self.state.device_id(),
             ),
         )
@@ -2412,7 +2589,7 @@ impl<S: Store> Manager<S, Registered> {
         &self,
         device_id: impl TryInto<DeviceId>,
     ) -> Result<(), Error<S::Error>> {
-        // secondary devices cannot unlink themselves or other devices, it will fail with an unauthorized error
+        // secondary devices can only unlink themselves, see `unlink_self`
         if self.registration_type() != RegistrationType::Primary {
             return Err(Error::NotPrimaryDevice);
         }
@@ -2433,6 +2610,39 @@ impl<S: Store> Manager<S, Registered> {
         );
 
         Ok(account_manager.linked_devices(&aci_protocol_store).await?)
+    }
+
+    /// Removes this linked device from the account, e.g. before linking again.
+    pub async fn unlink_self(&self) -> Result<(), Error<S::Error>> {
+        if self.registration_type() == RegistrationType::Primary {
+            return Err(Error::NotSecondaryDevice);
+        }
+        self.identified_websocket(false)
+            .await?
+            .unlink_device(self.device_id())
+            .await?;
+        Ok(())
+    }
+
+    /// Update the name of this device.
+    pub async fn update_device_name(&mut self, name: &str) -> Result<(), Error<S::Error>> {
+        let aci = self.state.data.service_ids.aci;
+        let aci_protocol_store = self.store.aci_protocol_store();
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(self.state.data.profile_key),
+        );
+        account_manager
+            .update_device_name(
+                self.device_id(),
+                name,
+                aci.into(),
+                &aci_protocol_store,
+                &mut rng(),
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -2516,6 +2726,84 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
         }
         _ => (),
     }
+}
+
+async fn sync_groups_from_storage_service<S: Store>(
+    store: &S,
+    push_service: PushService,
+    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+) -> Result<(), Error<S::Error>> {
+    const READ_CHUNK: usize = 100;
+
+    let master_key = store
+        .fetch_master_key()
+        .await?
+        .ok_or(Error::MissingKeyError("master_key".into()))?;
+    let storage_key = StorageServiceKey::from_master_key(&master_key);
+    let storage = StorageService::new(push_service, storage_key).await?;
+
+    let manifest = storage.manifest().await?;
+    let group_ids: Vec<Vec<u8>> = manifest
+        .identifiers
+        .iter()
+        .filter(|id| id.r#type() == manifest_record::identifier::Type::Groupv2)
+        .map(|id| id.raw.clone())
+        .collect();
+    debug!(
+        count = group_ids.len(),
+        "groups listed in the storage service"
+    );
+
+    for chunk in group_ids.chunks(READ_CHUNK) {
+        let records = match storage
+            .read_items(chunk.to_vec(), Some(&manifest.record_ikm))
+            .await
+        {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(%error, "failed to read group records from the storage service");
+                continue;
+            }
+        };
+        for record in records {
+            let Some(storage_record::Record::GroupV2(record)) = record.record else {
+                continue;
+            };
+            if let Err(error) = save_unknown_group(store, groups_manager, &record.master_key).await
+            {
+                warn!(%error, "failed to fetch group listed in the storage service");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Incoming messages keep known groups current, so only unknown ones are fetched.
+async fn save_unknown_group<S: Store>(
+    store: &S,
+    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    master_key_bytes: &[u8],
+) -> Result<(), Error<S::Error>> {
+    let master_key: GroupMasterKeyBytes = master_key_bytes.try_into()?;
+    if store.group(master_key).await?.is_some() || store.is_group_left(master_key).await? {
+        return Ok(());
+    }
+    match groups_manager
+        .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+        .await
+    {
+        Ok(encrypted_group) => {
+            let group = decrypt_group(master_key_bytes, encrypted_group)?;
+            store.save_group(master_key, group).await?;
+        }
+        // The group server refuses groups the account has left or was only invited to.
+        Err(libsignal_service::prelude::ServiceError::Unauthorized) => {
+            debug!("not a member of a group listed in the storage service");
+            store.mark_group_left(master_key).await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 async fn upsert_group<S: Store>(
@@ -2738,10 +3026,10 @@ async fn save_message<S: Store>(
             for d in delete.message_deletes.iter().flat_map(|m| &m.messages) {
                 let sender = match &d.author {
                     Some(Author::AuthorServiceId(id)) => {
-                        ServiceId::parse_from_service_id_string(&id)
+                        ServiceId::parse_from_service_id_string(id)
                     }
                     Some(Author::AuthorServiceIdBinary(id)) => {
-                        ServiceId::parse_from_service_id_binary(&id)
+                        ServiceId::parse_from_service_id_binary(id)
                     }
                     Some(Author::AuthorE164(_)) => None,
                     None => None,
@@ -2790,8 +3078,9 @@ async fn save_message<S: Store>(
                 })),
             ..
         }) => Some(message),
-        ContentBody::CallMessage(_)
-        | ContentBody::SynchronizeMessage(SyncMessage {
+        // Call signaling is transient; calls are recorded by `CallEvent`s instead.
+        ContentBody::CallMessage(_) => None,
+        ContentBody::SynchronizeMessage(SyncMessage {
             content: Some(SyncContent::CallEvent(_)),
             ..
         }) => Some(message),

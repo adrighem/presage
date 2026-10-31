@@ -32,7 +32,7 @@ pub enum Error<S: std::error::Error> {
     ProtocolError(#[from] SignalProtocolError),
     #[error("libsignal-service error: {0}")]
     ServiceError(#[from] libsignal_service::prelude::ServiceError),
-    #[error("Signal storage service error: {0}")]
+    #[error("storage service error: {0}")]
     StorageServiceError(#[from] StorageServiceError),
     #[error("libsignal-service error: {0}")]
     ProfileManagerError(#[from] libsignal_service::ProfileManagerError),
@@ -92,12 +92,16 @@ pub enum Error<S: std::error::Error> {
     ProfileCipherError(#[from] libsignal_service::profile_cipher::ProfileCipherError),
     #[error("An operation was requested that requires the registration to be primary, but it was only secondary")]
     NotPrimaryDevice,
+    #[error("An operation was requested that requires the registration to be secondary, but it was primary")]
+    NotSecondaryDevice,
     #[error("Failed to get initial messages after uploading pre-keys")]
     UpdatePreKeyFailure,
     #[error("invalid device ID (out of bounds)")]
     InvalidDeviceId,
     #[error("invalid Signal username: {0}")]
     InvalidUsername(#[from] UsernameError),
+    #[error("link preview error: {0}")]
+    LinkPreview(#[from] crate::model::previews::Error),
 }
 
 impl<S: std::error::Error> From<MessageSenderError> for Error<S> {

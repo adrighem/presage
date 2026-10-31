@@ -85,7 +85,7 @@ impl SessionStore for SqliteProtocolStore {
         let address = address.name();
         let record = record.serialize()?;
 
-        let mut transaction = self.store.db.begin().await.into_protocol_error()?;
+        let mut transaction = self.store.begin_write().await.into_protocol_error()?;
 
         // Note: It is faster to do the update in a separate query and only insert the record if
         // the update did not do anything.
@@ -130,7 +130,7 @@ impl SessionStoreExt for SqliteProtocolStore {
         &self,
         name: &ServiceId,
     ) -> Result<Vec<DeviceId>, SignalProtocolError> {
-        let address: String = name.raw_uuid().to_string();
+        let address = name.service_id_string();
         let device_id: u8 = (*DEFAULT_DEVICE_ID).into();
         query_scalar!(
             "SELECT device_id AS 'id: u32' FROM sessions
@@ -171,7 +171,7 @@ impl SessionStoreExt for SqliteProtocolStore {
     ///
     /// Returns the number of deleted sessions.
     async fn delete_all_sessions(&self, name: &ServiceId) -> Result<usize, SignalProtocolError> {
-        let address = name.raw_uuid();
+        let address = name.service_id_string();
         let res = query!(
             "DELETE FROM sessions WHERE address = ? AND identity = ?",
             address,
@@ -418,7 +418,7 @@ impl KyberPreKeyStore for SqliteProtocolStore {
         ec_prekey_id: SignedPreKeyId,
         base_key: &PublicKey,
     ) -> Result<(), SignalProtocolError> {
-        let mut transaction = self.store.db.begin().await.into_protocol_error()?;
+        let mut transaction = self.store.begin_write().await.into_protocol_error()?;
 
         let kyber_prekey_id: u32 = kyber_prekey_id.into();
 
@@ -593,7 +593,7 @@ impl IdentityKeyStore for SqliteProtocolStore {
         let address = address.name();
         let bytes = identity.serialize();
 
-        let mut tx = self.store.db.begin().await.into_protocol_error()?;
+        let mut tx = self.store.begin_write().await.into_protocol_error()?;
 
         // Note: It is faster to do the update in a separate query and only insert the record if
         // the update did not do anything.
@@ -954,6 +954,46 @@ mod test {
                 .await
                 .is_err()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sessions_by_service_id() -> Result<(), Box<dyn std::error::Error>> {
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut protocol_store = SqliteProtocolStore {
+            store: sqlite_store,
+            identity: IdentityType::Aci,
+        };
+
+        let uuid = Uuid::from_u128(1);
+        let aci: ServiceId = presage::libsignal_service::protocol::Aci::from(uuid).into();
+        let pni: ServiceId = presage::libsignal_service::protocol::Pni::from(uuid).into();
+        let record = SessionRecord::new_fresh();
+
+        for (service_id, device_id) in [(aci, 1), (aci, 2), (pni, 1), (pni, 3)] {
+            let address =
+                ProtocolAddress::new(service_id.service_id_string(), device_id.try_into()?);
+            protocol_store.store_session(&address, &record).await?;
+        }
+
+        assert_eq!(
+            protocol_store.get_sub_device_sessions(&aci).await?,
+            vec![2.try_into()?]
+        );
+        assert_eq!(
+            protocol_store.get_sub_device_sessions(&pni).await?,
+            vec![3.try_into()?]
+        );
+
+        assert_eq!(protocol_store.delete_all_sessions(&aci).await?, 2);
+        assert!(
+            protocol_store
+                .get_sub_device_sessions(&aci)
+                .await?
+                .is_empty()
+        );
+        assert_eq!(protocol_store.delete_all_sessions(&pni).await?, 2);
 
         Ok(())
     }

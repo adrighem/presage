@@ -251,7 +251,7 @@ pub trait ContentsStore: Send + Sync {
     /// Delete all cached group data
     fn clear_groups(&mut self) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
-    /// Save a group in the cache
+    /// Save a group in the cache. This clears its [left](Self::mark_group_left) mark.
     fn save_group(
         &self,
         master_key: GroupMasterKeyBytes,
@@ -285,6 +285,18 @@ pub trait ContentsStore: Send + Sync {
         &self,
         master_key: GroupMasterKeyBytes,
     ) -> impl Future<Output = Result<Option<Group>, Self::ContentsStoreError>>;
+
+    /// Mark a group as left: the group server refuses its state to this account.
+    fn mark_group_left(
+        &self,
+        master_key: GroupMasterKeyBytes,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
+
+    /// Whether a group is [marked as left](Self::mark_group_left).
+    fn is_group_left(
+        &self,
+        master_key: GroupMasterKeyBytes,
+    ) -> impl Future<Output = Result<bool, Self::ContentsStoreError>>;
 
     /// Save a group avatar in the cache
     fn save_group_avatar(
@@ -434,6 +446,8 @@ impl fmt::Display for Thread {
 pub enum ThreadError {
     #[error("invalid service ID")]
     InvalidServiceId,
+    #[error("invalid group master key")]
+    InvalidGroupMasterKey,
 }
 
 impl TryFrom<&Content> for Thread {
@@ -520,10 +534,21 @@ impl TryFrom<&Content> for Thread {
                     }),
                 ..
             }) => Ok(Self::Group(
-                key.clone()
+                key.as_slice()
                     .try_into()
-                    .expect("Group master key to have 32 bytes"),
+                    .map_err(|_| ThreadError::InvalidGroupMasterKey)?,
             )),
+            // [1-1] Call log entry from one of our devices
+            ContentBody::SynchronizeMessage(SyncMessage {
+                content:
+                    Some(SyncContent::CallEvent(sync_message::CallEvent {
+                        conversation_id: Some(conversation_id),
+                        ..
+                    })),
+                ..
+            }) if let Some(service_id) = ServiceId::parse_from_service_id_binary(conversation_id) => {
+                Ok(Self::Contact(service_id))
+            }
             // [1-1] Any other message directly to us
             _ => Ok(Thread::Contact(content.metadata.sender)),
         }
@@ -658,4 +683,47 @@ pub async fn save_trusted_identity_message<S: Store>(
     };
 
     store.save_message(&thread, verified_sync_message).await
+}
+
+#[cfg(test)]
+mod tests {
+    use libsignal_service::{
+        content::{Content, ContentBody, Metadata},
+        prelude::Uuid,
+        proto::{sync_message, SyncMessage},
+        protocol::{Aci, ServiceId},
+    };
+
+    use super::Thread;
+
+    #[test]
+    fn call_event_thread() {
+        let own: ServiceId = Aci::from(Uuid::from_u128(1)).into();
+        let peer: ServiceId = Aci::from(Uuid::from_u128(2)).into();
+        let now = chrono::Utc::now();
+        let content = Content {
+            metadata: Metadata {
+                sender: own,
+                sender_device: 1.try_into().unwrap(),
+                destination: own,
+                server_guid: None,
+                client_timestamp: now,
+                server_timestamp: now,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                pni_verified: None,
+            },
+            body: ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(sync_message::Content::CallEvent(sync_message::CallEvent {
+                    conversation_id: Some(peer.service_id_binary()),
+                    call_id: Some(42),
+                    timestamp: Some(1_700_000_000_000),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(Thread::try_from(&content).unwrap(), Thread::Contact(peer));
+    }
 }
