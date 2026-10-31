@@ -1,11 +1,10 @@
 [package]
+# be a sign or warning of (an imminent event, typically an unwelcome one).
 name = "presage"
-version = "0.6.0"
-authors = ["Vincent van Adrighem <vincent@vanadrighem.eu>"]
-edition = "2024"
+version = "0.8.0-dev"
+authors = ["Gabriel Féron <g@leirbag.net>"]
+edition = "2021"
 license = "AGPL-3.0-only"
-description = "A client library for the Signal network"
-repository = "https://github.com/whisperfish/presage"
 
 [features]
 default = []
