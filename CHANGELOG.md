@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Manager::set_link_previews_enabled` turns off the automatic link preview fetched when sending a
+  data message; `Manager::link_preview` stays available to build one explicitly.
 - Merged the signal-purple fork branch (`fix/signal-purple-boundaries`) into `main`: group synchronization
   from Storage Service, encrypted client outbox, client message projection, verified-identity replacement
   gating (`OnNewIdentity::TrustUnverified`), group reconcile/leave support, and attachment + contact profile

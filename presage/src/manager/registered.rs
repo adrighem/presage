@@ -469,6 +469,7 @@ pub struct Registered {
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
     contact_updates: ContactUpdateCoordinator,
     pub(crate) link_preview_client: OnceLock<reqwest::Client>,
+    link_previews_enabled: bool,
 
     pub(crate) data: Arc<RegistrationData>,
 }
@@ -489,6 +490,7 @@ impl Registered {
             unidentified_sender_certificate: Default::default(),
             contact_updates: Default::default(),
             link_preview_client: Default::default(),
+            link_previews_enabled: true,
             data: Arc::new(data),
         }
     }
@@ -591,6 +593,12 @@ impl<S: Store> Manager<S, Registered> {
             store,
             state: registered,
         })
+    }
+
+    /// Whether sending a data message fetches a preview for its first link. Enabled by
+    /// default. Disabling it leaves [Self::link_preview] as the explicit way to build one.
+    pub fn set_link_previews_enabled(&mut self, enabled: bool) {
+        self.state.link_previews_enabled = enabled;
     }
 
     /// Returns a handle to the [Store] implementation.
@@ -2069,10 +2077,7 @@ impl<S: Store> Manager<S, Registered> {
         let ContentBody::DataMessage(message) = content_body else {
             return;
         };
-        if !message.preview.is_empty() {
-            return;
-        }
-        let Some(body) = message.body.as_deref() else {
+        let Some(body) = previewable_body(self.state.link_previews_enabled, message) else {
             return;
         };
         match self.link_preview(body).await {
@@ -3565,6 +3570,14 @@ async fn register_pre_keys<S: Store>(
     Ok(())
 }
 
+/// The body to fetch a link preview for, if automatic previews apply to `message`.
+fn previewable_body(enabled: bool, message: &DataMessage) -> Option<&str> {
+    if !enabled || !message.preview.is_empty() {
+        return None;
+    }
+    message.body.as_deref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3642,6 +3655,28 @@ mod tests {
             }
             exponent += 1;
         }
+    }
+
+    #[test]
+    fn automatic_link_previews_respect_the_switch_and_existing_previews() {
+        let message = DataMessage {
+            body: Some("see https://signal.org".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            previewable_body(true, &message),
+            Some("see https://signal.org")
+        );
+        assert_eq!(previewable_body(false, &message), None);
+
+        let with_preview = DataMessage {
+            preview: vec![libsignal_service::proto::Preview::default()],
+            ..message.clone()
+        };
+        assert_eq!(previewable_body(true, &with_preview), None);
+
+        let without_body = DataMessage::default();
+        assert_eq!(previewable_body(true, &without_body), None);
     }
 
     #[test]
