@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Commit pre-key removal in the same transaction as the session it produced. A failed session
+  write no longer deletes the pre-key, which left the sender's ratchet ahead and broke decryption.
+- Retry envelopes that fail on store contention (`TransientStoreError`), then leave them
+  unacknowledged for redelivery instead of dropping them. Permanent failures are still skipped.
 - Serialize SQLite store pool access (`max_connections(1)`), so concurrent writers no longer race
   read-modify-write protocol-state transactions into `SQLITE_BUSY`.
 
