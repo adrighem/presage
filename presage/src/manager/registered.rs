@@ -4562,7 +4562,6 @@ mod pre_key_refresh_tests {
 
         // QueueEmpty arrives and refreshes pre-keys
         initial_queue_drained = true;
-        pre_keys_dirty = false;
         last_pre_key_refresh = Some(Instant::now());
 
         // Now we receive another PreKeyBundle immediately after QueueEmpty

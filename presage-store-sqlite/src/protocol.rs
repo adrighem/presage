@@ -405,6 +405,58 @@ impl PreKeysStore for SqliteProtocolStore {
         .into_protocol_error()
         .map(|id| id.map(From::from))
     }
+
+    /// One transaction instead of one fsync per key.
+    async fn save_pre_keys(
+        &mut self,
+        records: &[(PreKeyId, PreKeyRecord)],
+    ) -> Result<(), SignalProtocolError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.store.begin_write().await.into_protocol_error()?;
+        for (id, record) in records {
+            sqlx::query(
+                "INSERT INTO pre_keys (id, identity, record)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT DO UPDATE SET record = ?3",
+            )
+            .bind(u32::from(*id))
+            .bind(self.identity)
+            .bind(record.serialize()?)
+            .execute(&mut *transaction)
+            .await
+            .into_protocol_error()?;
+        }
+        transaction.commit().await.into_protocol_error()?;
+        Ok(())
+    }
+
+    /// See [`Self::save_pre_keys`].
+    async fn save_kyber_pre_keys(
+        &mut self,
+        records: &[(KyberPreKeyId, KyberPreKeyRecord)],
+    ) -> Result<(), SignalProtocolError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.store.begin_write().await.into_protocol_error()?;
+        for (id, record) in records {
+            sqlx::query(
+                "INSERT INTO kyber_pre_keys (id, identity, record)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT DO UPDATE SET record = ?3",
+            )
+            .bind(u32::from(*id))
+            .bind(self.identity)
+            .bind(record.serialize()?)
+            .execute(&mut *transaction)
+            .await
+            .into_protocol_error()?;
+        }
+        transaction.commit().await.into_protocol_error()?;
+        Ok(())
+    }
 }
 
 #[async_trait(?Send)]
@@ -1035,6 +1087,56 @@ mod test {
                 .await
                 .is_err()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_pre_key_saves_store_and_update() -> Result<(), Box<dyn std::error::Error>> {
+        let mut rng = rand::rng();
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut protocol_store = SqliteProtocolStore::new(sqlite_store, IdentityType::Aci);
+        let identity = KeyPair::generate(&mut rng);
+
+        let new_pre_keys = |rng: &mut _| -> Vec<(PreKeyId, PreKeyRecord)> {
+            (1..=3u32)
+                .map(|i| {
+                    let id = PreKeyId::from(i);
+                    (id, PreKeyRecord::new(id, &KeyPair::generate(rng)))
+                })
+                .collect()
+        };
+        let new_kyber_pre_keys = || -> Result<Vec<(KyberPreKeyId, KyberPreKeyRecord)>, _> {
+            (1..=3u32)
+                .map(|i| {
+                    let id = KyberPreKeyId::from(i);
+                    KyberPreKeyRecord::generate(kem::KeyType::Kyber1024, id, &identity.private_key)
+                        .map(|record| (id, record))
+                })
+                .collect()
+        };
+
+        // Empty batches are a no-op
+        protocol_store.save_pre_keys(&[]).await?;
+        protocol_store.save_kyber_pre_keys(&[]).await?;
+        assert!(protocol_store.get_pre_key(PreKeyId::from(1)).await.is_err());
+
+        // Saving, then saving again with the same ids, updates in place
+        for _ in 0..2 {
+            let pre_keys = new_pre_keys(&mut rng);
+            let kyber_pre_keys = new_kyber_pre_keys()?;
+            protocol_store.save_pre_keys(&pre_keys).await?;
+            protocol_store.save_kyber_pre_keys(&kyber_pre_keys).await?;
+
+            for (id, record) in &pre_keys {
+                let stored = protocol_store.get_pre_key(*id).await?;
+                assert_eq!(stored.serialize()?, record.serialize()?);
+            }
+            for (id, record) in &kyber_pre_keys {
+                let stored = protocol_store.get_kyber_pre_key(*id).await?;
+                assert_eq!(stored.serialize()?, record.serialize()?);
+            }
+        }
 
         Ok(())
     }

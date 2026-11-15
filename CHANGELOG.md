@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Serialize SQLite store pool access (`max_connections(1)`), so concurrent writers no longer race
   read-modify-write protocol-state transactions into `SQLITE_BUSY`.
 
+- Save the pre-keys generated on startup in one transaction per kind instead of one commit per key
+  (`PreKeysStore::save_pre_keys` / `save_kyber_pre_keys`), so they no longer hold the only store
+  connection for over a second and stall incoming message handling.
+
 ### Changed
 
 - The fork work above was reconciled onto the libsignal 0.99.0 / sqlx 0.9 upgrade: `Metadata::timestamp`
