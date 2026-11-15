@@ -14,9 +14,9 @@ use libsignal_service::{
     },
     protocol::{
         IdentityKey, IdentityKeyPair, ProtocolAddress, ProtocolStore, SenderCertificate,
-        SenderKeyStore, ServiceId,
+        SenderKeyStore, ServiceId, SignalProtocolError,
     },
-    push_service::DEFAULT_DEVICE_ID,
+    push_service::{ServiceError, DEFAULT_DEVICE_ID},
     session_store::SessionStoreExt,
     zkgroup::GroupMasterKeyBytes,
     Profile,
@@ -32,6 +32,32 @@ use crate::{
 
 /// An error trait implemented by store error types
 pub trait StoreError: std::error::Error + Sync + Send {}
+
+/// A store failure that may succeed when retried, such as lock contention or a pool timeout.
+///
+/// Stores report it as [`SignalProtocolError::ApplicationCallbackError`]. The receive loop then
+/// retries the envelope, and leaves it unacknowledged for redelivery instead of dropping it.
+///
+/// [`SignalProtocolError::ApplicationCallbackError`]: libsignal_service::protocol::SignalProtocolError::ApplicationCallbackError
+#[derive(Debug, thiserror::Error)]
+#[error("transient store error: {0}")]
+pub struct TransientStoreError(pub String);
+
+impl TransientStoreError {
+    /// Whether `error` was caused by a [`TransientStoreError`].
+    pub fn is_cause_of(error: &ServiceError) -> bool {
+        let protocol_error = match error {
+            ServiceError::SignalProtocolError(error) => error,
+            ServiceError::SealedSenderDecryptionError(error) => &error.inner,
+            _ => return false,
+        };
+        let SignalProtocolError::ApplicationCallbackError(_, source) = protocol_error else {
+            return false;
+        };
+        let source: &(dyn std::error::Error + 'static) = source.as_ref();
+        source.is::<TransientStoreError>()
+    }
+}
 
 /// Stores the registered state of the manager
 pub trait StateStore {

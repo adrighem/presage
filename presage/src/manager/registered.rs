@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
 use futures::future::LocalBoxFuture;
@@ -17,6 +17,7 @@ use libsignal_service::{
     configuration::{Endpoint, ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
+    envelope::Envelope,
     groups_v2::{
         decrypt_group, GroupChange, GroupDecodingError, GroupOperations, GroupsManager,
         InMemoryCredentialsCache,
@@ -39,7 +40,8 @@ use libsignal_service::{
         GroupResponse, NullMessage, StorageRecord, SyncMessage, Verified,
     },
     protocol::{
-        Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
+        Aci, DeviceId, IdentityKeyStore, ProtocolStore, SenderCertificate, SenderKeyStore,
+        ServiceId, ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
     push_service::{HttpAuthOverride, PushService, ServiceError, ServiceIds, DEFAULT_DEVICE_ID},
@@ -77,6 +79,7 @@ use crate::model::previews;
 use crate::serde::serde_profile_key;
 use crate::store::{
     ContentExt, ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread,
+    TransientStoreError,
 };
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
@@ -1468,10 +1471,11 @@ impl<S: Store> Manager<S, Registered> {
                                         continue;
                                     }
                                     Some(ServiceId::Aci(_)) => {
-                                        state
-                                            .service_cipher_aci
-                                            .open_envelope(envelope, &mut rand::rng())
-                                            .await
+                                        open_envelope_retrying(
+                                            &mut state.service_cipher_aci,
+                                            envelope,
+                                        )
+                                        .await
                                     }
                                     Some(ServiceId::Pni(pni)) => {
                                         if pni == state.service_ids.pni()
@@ -1480,13 +1484,17 @@ impl<S: Store> Manager<S, Registered> {
                                             warn!("Got a sealed sender message to our PNI? Invalid message, ignoring.");
                                             continue;
                                         }
-                                        state
-                                            .service_cipher_pni
-                                            .open_envelope(envelope, &mut rng())
-                                            .await
+                                        open_envelope_retrying(
+                                            &mut state.service_cipher_pni,
+                                            envelope,
+                                        )
+                                        .await
                                     }
                                 }
                             };
+                            // Store still busy: end the stream without polling it again, so the
+                            // envelope stays unacknowledged and is redelivered on reconnect.
+                            let envelope = envelope?;
 
                             if state.initial_queue_drained
                                 && !state.queue_empty_pending
@@ -3552,6 +3560,54 @@ async fn set_account_attributes<S: Store>(
     Ok(())
 }
 
+/// Delays between attempts to open an envelope while the store reports transient contention.
+const ENVELOPE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(50),
+    Duration::from_millis(150),
+    Duration::from_millis(300),
+];
+
+/// Opens `envelope`, retrying while the store reports a [`TransientStoreError`].
+///
+/// Returns `None` when contention outlasts [`ENVELOPE_RETRY_DELAYS`]. Permanent failures are
+/// returned, so the envelope is acknowledged rather than redelivered forever.
+async fn open_envelope_retrying<P>(
+    cipher: &mut ServiceCipher<P>,
+    envelope: Envelope,
+) -> Option<Result<Option<Content>, ServiceError>>
+where
+    P: ProtocolStore + SenderKeyStore + SessionStoreExt + Clone,
+{
+    retry_on_transient_store_error(&ENVELOPE_RETRY_DELAYS, async || {
+        cipher.open_envelope(envelope.clone(), &mut rng()).await
+    })
+    .await
+}
+
+/// Runs `attempt`, then again after each of `delays` while it fails with a
+/// [`TransientStoreError`]. Returns `None` if it still does after the last delay.
+async fn retry_on_transient_store_error<T>(
+    delays: &[Duration],
+    mut attempt: impl AsyncFnMut() -> Result<T, ServiceError>,
+) -> Option<Result<T, ServiceError>> {
+    let mut delays = delays.iter();
+    loop {
+        match attempt().await {
+            Err(error) if TransientStoreError::is_cause_of(&error) => match delays.next() {
+                Some(delay) => {
+                    warn!(%error, ?delay, "transient store error opening envelope, retrying");
+                    tokio::time::sleep(*delay).await;
+                }
+                None => {
+                    error!(%error, "store still busy, leaving envelope for redelivery");
+                    return None;
+                }
+            },
+            result => return Some(result),
+        }
+    }
+}
+
 async fn register_pre_keys<S: Store>(
     store: &S,
     account_manager: &mut AccountManager,
@@ -3592,6 +3648,84 @@ mod tests {
 
     fn aci(value: u128) -> Aci {
         Aci::from(Uuid::from_u128(value))
+    }
+
+    fn transient_store_error() -> ServiceError {
+        ServiceError::SignalProtocolError(
+            libsignal_service::protocol::SignalProtocolError::ApplicationCallbackError(
+                "test store",
+                Box::new(TransientStoreError("database is locked".into())),
+            ),
+        )
+    }
+
+    const NO_DELAYS: [Duration; 3] = [Duration::ZERO; 3];
+
+    #[tokio::test]
+    async fn envelope_retry_succeeds_once_contention_clears() {
+        let mut attempts = 0;
+        let result = retry_on_transient_store_error(&NO_DELAYS, async || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(transient_store_error())
+            } else {
+                Ok(attempts)
+            }
+        })
+        .await;
+
+        assert!(matches!(result, Some(Ok(3))));
+    }
+
+    #[tokio::test]
+    async fn envelope_retry_gives_up_for_redelivery_when_contention_persists() {
+        let mut attempts = 0;
+        let result = retry_on_transient_store_error(&NO_DELAYS, async || -> Result<(), _> {
+            attempts += 1;
+            Err(transient_store_error())
+        })
+        .await;
+
+        // One attempt per delay plus the first; `None` leaves the envelope unacknowledged.
+        assert!(result.is_none());
+        assert_eq!(attempts, NO_DELAYS.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn envelope_retry_returns_permanent_errors_at_once() {
+        let mut attempts = 0;
+        let result = retry_on_transient_store_error(&NO_DELAYS, async || -> Result<(), _> {
+            attempts += 1;
+            Err(ServiceError::SignalProtocolError(
+                libsignal_service::protocol::SignalProtocolError::InvalidProtobufEncoding,
+            ))
+        })
+        .await;
+
+        // A poison message is handed back to be acknowledged, never retried.
+        assert!(matches!(result, Some(Err(_))));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn transient_store_error_is_found_behind_sealed_sender() {
+        let libsignal_service::prelude::ServiceError::SignalProtocolError(inner) =
+            transient_store_error()
+        else {
+            unreachable!()
+        };
+        let sealed_sender = ServiceError::SealedSenderDecryptionError(
+            libsignal_service::cipher::SealedSenderDecryptionError::from(inner),
+        );
+        assert!(TransientStoreError::is_cause_of(&sealed_sender));
+
+        let other_callback = ServiceError::SignalProtocolError(
+            libsignal_service::protocol::SignalProtocolError::ApplicationCallbackError(
+                "test store",
+                Box::new(std::fmt::Error),
+            ),
+        );
+        assert!(!TransientStoreError::is_cause_of(&other_callback));
     }
 
     fn signal_sender_ciphertext_size(plaintext_size: usize) -> usize {

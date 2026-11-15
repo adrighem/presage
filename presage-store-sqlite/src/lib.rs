@@ -111,17 +111,11 @@ impl Store for SqliteStore {
     }
 
     fn aci_protocol_store(&self) -> Self::AciStore {
-        SqliteProtocolStore {
-            store: self.clone(),
-            identity: IdentityType::Aci,
-        }
+        SqliteProtocolStore::new(self.clone(), IdentityType::Aci)
     }
 
     fn pni_protocol_store(&self) -> Self::PniStore {
-        SqliteProtocolStore {
-            store: self.clone(),
-            identity: IdentityType::Pni,
-        }
+        SqliteProtocolStore::new(self.clone(), IdentityType::Pni)
     }
 }
 
